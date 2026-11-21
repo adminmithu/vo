@@ -1,1128 +1,1803 @@
-import sys
+import asyncio
+import html
+import logging
 import os
-import time
-import threading
+import random
 import re
+import sys
+import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-import telebot
-from telebot import types
-import config
-import database
-from vook_api import VookMailClient, VOOK_GROUPS
 
-# Initialize database
-database.init_db()
+# Enable UTF-8 for console output on Windows
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+import httpx
+import inspect
+from telegram import (
+    BotCommand,
+    KeyboardButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+    Update,
+)
 
-# Initialize VookMail Client
-vook_client = VookMailClient()
+try:
+    from telegram import CopyTextButton
+    HAS_COPY_TEXT = True
+except ImportError:
+    CopyTextButton = None
+    HAS_COPY_TEXT = False
 
-# Initialize TeleBot
-bot = telebot.TeleBot(config.BOT_TOKEN, parse_mode="HTML")
+# Ensure cross-version compatibility for python-telegram-bot
+if "style" not in inspect.signature(KeyboardButton.__init__).parameters:
+    _orig_kb_init = KeyboardButton.__init__
+    def _safe_kb_init(self, *args, **kwargs):
+        kwargs.pop("style", None)
+        return _orig_kb_init(self, *args, **kwargs)
+    KeyboardButton.__init__ = _safe_kb_init
 
-# Exact popular services from VookMail website
-VOOK_SERVICES = [
-    {"name": "ChatGPT", "icon": "🤖"},
-    {"name": "Telegram", "icon": "💬"},
-    {"name": "Discord", "icon": "🎮"},
-    {"name": "Facebook", "icon": "🔵"},
-    {"name": "Instagram", "icon": "📸"},
-    {"name": "TikTok", "icon": "🎵"},
-    {"name": "Twitter / X", "icon": "🐦"},
-    {"name": "Reddit", "icon": "👽"},
-    {"name": "Netflix", "icon": "🍿"},
-    {"name": "Spotify", "icon": "🎧"},
-    {"name": "Steam", "icon": "🕹️"},
-    {"name": "Amazon", "icon": "🛒"},
-    {"name": "10 Minute Mail", "icon": "⏱️"},
-    {"name": "Burner Email", "icon": "🔥"},
-    {"name": "Throwaway Email", "icon": "🗑️"},
+if "style" not in inspect.signature(InlineKeyboardButton.__init__).parameters:
+    _orig_ikb_init = InlineKeyboardButton.__init__
+    def _safe_ikb_init(self, *args, **kwargs):
+        kwargs.pop("style", None)
+        if not HAS_COPY_TEXT:
+            kwargs.pop("copy_text", None)
+        return _orig_ikb_init(self, *args, **kwargs)
+    InlineKeyboardButton.__init__ = _safe_ikb_init
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    ConversationHandler,
+    MessageHandler,
+    filters,
+)
+
+from config import (
+    ADMIN_ID,
+    BOT_TOKEN,
+    DB_PATH,
+    DOMAIN,
+    POLL_INTERVAL,
+    MUELLFACH_BASE_URL,
+)
+from database import (
+    clear_all_saved_emails,
+    delete_saved_email,
+    get_active_users_to_poll,
+    get_all_user_ids,
+    get_all_users_stats,
+    get_email_by_message_id,
+    get_live_analytics,
+    get_or_create_user,
+    get_saved_email_by_id,
+    get_saved_emails,
+    get_saved_otp,
+    get_top_users,
+    init_db,
+    is_message_seen,
+    is_username_taken,
+    log_user_message,
+    mark_message_seen,
+    save_email,
+    set_active_email,
+    toggle_auto_forward,
+)
+from muellfach import (
+    detect_service_info,
+    extract_otp_code,
+    get_mailbox_messages,
+    get_single_mail,
+    strip_html_tags,
+    sync_mailbox,
+)
+
+# Logging configuration
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("MailFuetch")
+
+# Track bot launch time for uptime calculation
+BOT_START_TIME = datetime.now()
+
+def get_uptime_str() -> str:
+    delta = datetime.now() - BOT_START_TIME
+    days = delta.days
+    hours, remainder = divmod(delta.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    parts = []
+    if days > 0:
+        parts.append(f"{days} দিন")
+    if hours > 0:
+        parts.append(f"{hours} ঘণ্টা")
+    if minutes > 0:
+        parts.append(f"{minutes} মিনিট")
+    parts.append(f"{seconds} সেকেন্ড")
+    return " ".join(parts)
+
+# States for Conversations
+WAITING_BROADCAST = 1
+WAITING_DIRECT_MSG = 2
+WAITING_LOGIN_INPUT = 3
+
+# Main Reply Keyboard with Native Button Background Colors
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [
+            KeyboardButton("📧 Create Mail", style="success"),
+        ],
+        [
+            KeyboardButton("🔑 Login Acc", style="primary"),
+        ],
+        [
+            KeyboardButton("📥 Current Inbox", style="primary"),
+            KeyboardButton("📁 Saved Mails", style="primary"),
+        ],
+        [
+            KeyboardButton("⚙️ Setting Fuetch", style="primary"),
+            KeyboardButton("🗑️ Delete Mailbox", style="danger"),
+        ],
+    ],
+    resize_keyboard=True,
+)
+
+# Admin Panel Reply Keyboard
+ADMIN_KEYBOARD = ReplyKeyboardMarkup(
+    [
+        [
+            KeyboardButton("📊 Live Analytics", style="primary"),
+            KeyboardButton("👥 Users List", style="primary"),
+        ],
+        [
+            KeyboardButton("🏆 Top Users", style="success"),
+            KeyboardButton("💾 Database Backup", style="primary"),
+        ],
+        [
+            KeyboardButton("📢 Broadcast", style="primary"),
+            KeyboardButton("💬 Send to User", style="primary"),
+        ],
+        [
+            KeyboardButton("🔄 Restart Bot", style="danger"),
+            KeyboardButton("🔙 Back to User Menu", style="primary"),
+        ],
+    ],
+    resize_keyboard=True,
+)
+
+def get_main_keyboard(user_id: int):
+    """Returns main menu with Create Mail at top, Login Acc, Current Inbox, and Admin Panel for Admin"""
+    rows = [
+        [
+            KeyboardButton("📧 Create Mail", style="success"),
+        ],
+        [
+            KeyboardButton("🔑 Login Acc", style="primary"),
+        ],
+        [
+            KeyboardButton("📥 Current Inbox", style="primary"),
+            KeyboardButton("📁 Saved Mails", style="primary"),
+        ],
+        [
+            KeyboardButton("⚙️ Setting Fuetch", style="primary"),
+            KeyboardButton("🗑️ Delete Mailbox", style="danger"),
+        ],
+    ]
+    if user_id == ADMIN_ID:
+        rows.append([KeyboardButton("👑 Admin Panel", style="primary")])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+def make_web_url(username: str) -> str:
+    return f"{MUELLFACH_BASE_URL}/postfach/{DOMAIN}/{username}"
+
+# ────────────────────────────────────────────────────────────────
+# Realistic Username Generator (e.g. sobujdadaroy6575687)
+# ────────────────────────────────────────────────────────────────
+
+FIRST_NAMES = [
+    "sobuj", "tanvir", "rakib", "shakil", "fahim", "arif", "sohel", "hasan",
+    "sabbir", "siam", "mehedi", "shuvo", "nahid", "rabbi", "alvi", "emon",
+    "riad", "badhon", "asif", "monir", "sourav", "tuhin", "sumon", "noyon",
+    "bappa", "robin", "hridoy", "sagar", "akash", "biplob", "milon", "mithu",
+    "joy", "nabil", "ashik", "priya", "ritu", "sadia", "tania", "nusrat"
 ]
 
-# Track user states for interactive flows
-USER_STATES = {}
+MIDDLE_NAMES = [
+    "dada", "babu", "kumar", "chandra", "ahmed", "hossain", "khan", "chowdhury",
+    "rahman", "islam", "sheikh", "uddin", "ali"
+]
 
-def get_all_admin_ids():
-    admins = list(config.ADMIN_IDS)
-    admin_str = database.get_setting("extra_admins", "")
-    if admin_str:
-        extra_admins = [int(x.strip()) for x in admin_str.split(",") if x.strip().isdigit()]
-        for a in extra_admins:
-            if a not in admins:
-                admins.append(a)
-    return admins
+LAST_NAMES = [
+    "roy", "das", "mondal", "biswas", "sarkar", "paul", "bhowmik", "datta",
+    "sen", "barman", "majumder", "talukder", "debnath", "ghosh", "dhar", "kar",
+    "ali", "miah", "haque", "kazi", "khan", "ahmed", "hossain", "islam"
+]
 
-def is_admin(user_id: int) -> bool:
-    return user_id in get_all_admin_ids()
+async def generate_unique_realistic_username() -> str:
+    """Generates realistic human username like 'sobujdadaroy6575687'"""
+    for _ in range(50):
+        first = random.choice(FIRST_NAMES)
+        mid = random.choice(MIDDLE_NAMES) if random.random() < 0.6 else ""
+        last = random.choice(LAST_NAMES)
+        num_digits = random.randint(4, 7)
+        digits = "".join([str(random.randint(0, 9)) for _ in range(num_digits)])
+        username = f"{first}{mid}{last}{digits}".lower()
+        if not await is_username_taken(username):
+            return username
+    return f"mailuser{random.randint(1000000, 9999999)}"
 
-def is_maintenance_active() -> bool:
-    return database.get_setting("maintenance_mode", "0") == "1"
+# ────────────────────────────────────────────────────────────────
+# Command Handlers
+# ────────────────────────────────────────────────────────────────
 
-# ----------------- Render Web Service Health Check -----------------
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles /start command with a modern, premium greeting and notifies admin of new users"""
+    user = update.effective_user
+    db_user = await get_or_create_user(user.id, user.first_name, user.username or "")
+    
+    # 🔔 Send instant Live Alert to Admin if it's a brand new user
+    if db_user.get("is_new") and user.id != ADMIN_ID:
+        tg_uname = f"@{user.username}" if user.username else "No Username"
+        now_str = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
+        alert_msg = (
+            f"🔔 <b>নতুন ইউজার জয়েন করেছে!</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>নাম:</b> <b>{html.escape(user.first_name)}</b>\n"
+            f"🔗 <b>ইউজারনেম:</b> {tg_uname}\n"
+            f"🆔 <b>User ID:</b> <code>{user.id}</code>\n"
+            f"⏰ <b>সময়:</b> {now_str}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=alert_msg,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception as alert_err:
+            logger.warning(f"Failed to send new user alert to admin: {alert_err}")
+    
+    admin_note = (
+        "👑 <b>অ্যাডমিন এক্সেস সক্রিয়:</b> ড্যাশবোর্ড পরিচালনা করতে নিচের <b>👑 Admin Panel</b> বাটনে চাপ দিন বা /admin লিখুন।\n━━━━━━━━━━━━━━━━━━━━━\n"
+        if user.id == ADMIN_ID
+        else ""
+    )
+    
+    welcome_text = (
+        f"✨ <b>স্বাগতম {html.escape(user.first_name)}! MailFuetch Pro-তে আপনাকে স্বাগতম।</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🚀 <b>হাই-স্পিড ইনস্ট্যান্ট ডিসপোজেবল ইমেইল প্ল্যাটফর্ম</b>\n"
+        f"কোনো রেজিস্ট্রেশন ছাড়াই আনলিমিটেড <b>@muellfach.de</b> টেম্পোরারি ইমেইল তৈরি করুন এবং রিয়েল-টাইমে সমস্ত ওটিপি ও মেসেজ গ্রহণ করুন!\n\n"
+        f"💎 <b>বটের এক্সক্লুসিভ ফিচারসমূহ:</b>\n"
+        f"• ⚡ <b>১-ক্লিক ইনস্ট্যান্ট মেইল:</b> কোনো ঝামেলা ছাড়াই মানুষের মতো বাস্তবধর্মী সুন্দর নামে মেইল তৈরি।\n"
+        f"• 🔑 <b>Login Acc:</b> যেকোনো পূর্বের ইউজারনেম বা মেইল দিয়ে লগইন করে ইনবক্স ব্যবহার।\n"
+        f"• 📋 <b>ওয়ান-ট্যাপ কপি:</b> ইমেইল এড্রেস ও ওটিপি এক ক্লিকেই সরাসরি ক্লিপবোর্ডে কপি করুন।\n"
+        f"• 📸 <b>ইনস্টাগ্রাম ও অন্যান্য অ্যাপ সাপোর্ট:</b> Instagram, Discord, Facebook, Telegram ও যেকোনো সার্ভিসের ওটিপি নিখুঁতভাবে রিসিভ হবে।\n"
+        f"• ⚡ <b>রিয়েল-টাইম অটো-ফরওয়ার্ড:</b> নতুন মেসেজ আসার ১ সেকেন্ডের মধ্যেই সরাসরি আপনার চ্যাটে চলে আসবে!\n"
+        f"• 📁 <b>১০ দিনের লাইভ হিস্ট্রি:</b> তৈরি করা যেকোনো মেইল বিগত ১০ দিন পর্যন্ত সংরক্ষণ থাকে এবং ১ ক্লিকে সক্রিয় করা যায়।\n"
+        f"• 🔒 <b>১০০% নিরাপদ ও স্প্যামমুক্ত:</b> আপনার আসল ব্যক্তিগত ইমেইলকে সুরক্ষিত রাখুন।\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{admin_note}"
+        f"👇 <b>শুরু করতে নিচের যেকোনো বাটনে ট্যাপ করুন:</b>"
+    )
+    await update.message.reply_text(
+        welcome_text,
+        reply_markup=get_main_keyboard(user.id),
+        parse_mode=ParseMode.HTML,
+    )
 
-class RenderHealthHandler(BaseHTTPRequestHandler):
+# ────────────────────────────────────────────────────────────────
+# 📧 1-Click Create Mail Handler
+# ────────────────────────────────────────────────────────────────
+
+async def create_mail_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Creates a new temporary email in 1 click with a realistic username"""
+    user = update.effective_user
+    user_id = user.id
+    await get_or_create_user(user_id, user.first_name, user.username or "")
+    
+    username = await generate_unique_realistic_username()
+    email_address = f"{username}@{DOMAIN}"
+    web_url = make_web_url(username)
+
+    # Save to database (replaces active email and adds to 10-day history)
+    await save_email(user_id, email_address, username)
+
+    # Trigger initial sync for this mailbox
+    async with httpx.AsyncClient() as client:
+        await sync_mailbox(client)
+
+    success_msg = (
+        f"🎉 <b>আপনার নতুন ইমেইল তৈরি হয়েছে!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📧 <b>Email:</b> <code>{email_address}</code>\n"
+        f"<i>(ট্যাপ করলেই কপি হয়ে যাবে)</i>\n\n"
+        f"🌐 <b>Web Link:</b> <a href=\"{web_url}\">Müllfach Web Postfach</a>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏳ <b>মেয়াদ:</b> এই মেইলটি আগামী <b>১০ দিন</b> আপনার <code>📁 Saved Mails</code> এ থাকবে।\n"
+        f"⚡ <b>রিয়েল-টাইম অটো ইনবক্স:</b> সক্রিয় আছে! কোনো ওটিপি বা মেসেজ আসলেই ২-৩ সেকেন্ডে সরাসরি এখানে চলে আসবে।"
+    )
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Copy Email", copy_text=CopyTextButton(text=email_address), style="success")],
+        [InlineKeyboardButton("🌐 ওপেন করুন ওয়েবে", url=web_url)],
+        [InlineKeyboardButton("🔄 ইনবক্স চেক করুন", callback_data="check_active_inbox", style="primary")],
+        [InlineKeyboardButton("➕ আরেকটি নতুন মেইল", callback_data="quick_create_mail", style="primary")]
+    ])
+
+    if update.callback_query:
+        await update.callback_query.answer("নতুন মেইল তৈরি হয়েছে!")
+        await update.callback_query.message.reply_text(
+            success_msg,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    else:
+        await update.message.reply_text(
+            success_msg,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+# ────────────────────────────────────────────────────────────────
+# 🔑 Login Account Handler (Connect via Username or Email)
+# ────────────────────────────────────────────────────────────────
+
+async def login_acc_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompts user to enter their email username or full email address"""
+    user_id = update.effective_user.id
+    text = (
+        "🔐 <b>আপনার একাউন্টে লগইন করুন:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"আপনার পূর্বে ব্যবহৃত বা যেকোনো <b>@{DOMAIN}</b> মেইলের <b>ইউজারনেম</b> অথবা <b>পুরো ইমেইল এড্রেস</b> লিখে পাঠান:\n\n"
+        f"💡 <i>যেমন:</i>\n"
+        f"<code>sobujroy6575687</code>\n"
+        f"অথবা\n"
+        f"<code>sobujroy6575687@{DOMAIN}</code>\n\n"
+        f"❌ বাতিল করতে /cancel লিখুন।"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    return WAITING_LOGIN_INPUT
+
+async def login_acc_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Processes login and connects user to the specified mailbox"""
+    user = update.effective_user
+    user_id = user.id
+    raw_input = update.message.text.strip()
+
+    # Extract username (support both 'name' and 'name@domain')
+    if "@" in raw_input:
+        username = raw_input.split("@")[0].strip().lower()
+    else:
+        username = raw_input.strip().lower()
+
+    # Clean username: remove spaces
+    username = re.sub(r"\s+", "", username)
+
+    if len(username) < 3 or not re.match(r"^[a-zA-Z0-9_\-]+$", username):
+        await update.message.reply_text(
+            "❌ <b>অকার্যকর ইউজারনেম!</b>\n\n"
+            "অনুগ্রহ করে শুধুমাত্র ইংরেজি অক্ষর (a-z), সংখ্যা (0-9), ড্যাশ বা আন্ডারস্কোর ব্যবহার করুন (কমপক্ষে ৩ অক্ষর)।\n\n"
+            "দয়া করে আবার লিখুন অথবা /cancel লিখুন:",
+            parse_mode=ParseMode.HTML,
+        )
+        return WAITING_LOGIN_INPUT
+
+    email_address = f"{username}@{DOMAIN}"
+    web_url = make_web_url(username)
+
+    status_msg = await update.message.reply_text(
+        f"⏳ <code>{email_address}</code> এর সাথে কানেক্ট করা হচ্ছে...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Save to user's database and set as active email
+    await save_email(user_id, email_address, username)
+
+    # Trigger IMAP sync and fetch existing messages
+    async with httpx.AsyncClient() as client:
+        await sync_mailbox(client)
+        mails = await get_mailbox_messages(client, email_address)
+
+    inbox_summary = ""
+    if mails:
+        inbox_summary = f"\n\n📬 <b>ইনবক্সে {len(mails)} টি মেইল রয়েছে!</b>"
+        for i, m in enumerate(mails[:3], 1):
+            s_subj = html.escape(m.get("subject") or "(No Subject)")
+            s_from = html.escape(m.get("sender_name") or m.get("sender_email") or "Unknown")
+            inbox_summary += f"\n{i}. <b>{s_subj}</b> — <i>{s_from}</i>"
+    else:
+        inbox_summary = "\n\n📭 <i>ইনবক্স বর্তমানে খালি। কোনো নতুন মেসেজ আসলে সাথে সাথে নোটিফিকেশন পাবেন।</i>"
+
+    success_text = (
+        f"✅ <b>সফলভাবে একাউন্টে লগইন সম্পন্ন হয়েছে!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📧 <b>Active Email:</b> <code>{email_address}</code>\n"
+        f"<i>(ট্যাপ করলেই কপি হয়ে যাবে)</i>\n\n"
+        f"🌐 <b>Web Link:</b> <a href=\"{web_url}\">Müllfach Postfach</a>\n"
+        f"⚡ <b>রিয়েল-টাইম অটো ইনবক্স:</b> সক্রিয় আছে ✅\n"
+        f"━━━━━━━━━━━━━━━━━━━━━"
+        f"{inbox_summary}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Copy Email", copy_text=CopyTextButton(text=email_address), style="success")],
+        [InlineKeyboardButton("📥 ইনবক্স চেক করুন", callback_data="check_active_inbox", style="primary")],
+        [InlineKeyboardButton("🌐 ওয়েবে দেখুন", url=web_url)],
+    ])
+
+    await status_msg.edit_text(
+        success_text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+    await update.message.reply_text(
+        "👇 নিচের মেন্যু থেকে কাজ চালিয়ে যেতে পারেন:",
+        reply_markup=get_main_keyboard(user_id),
+    )
+    return ConversationHandler.END
+
+async def cancel_login_acc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels login process"""
+    user_id = update.effective_user.id
+    await update.message.reply_text(
+        "❌ লগইন বাতিল করা হয়েছে।",
+        reply_markup=get_main_keyboard(user_id),
+    )
+    return ConversationHandler.END
+
+# ────────────────────────────────────────────────────────────────
+# 📁 Saved Mails (10-Day History & Switcher)
+# ────────────────────────────────────────────────────────────────
+
+async def saved_mails_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays saved emails from the last 10 days"""
+    user_id = update.effective_user.id
+    saved = await get_saved_emails(user_id)
+    
+    if not saved:
+        await update.message.reply_text(
+            "📭 <b>আপনার কোনো সেভ করা মেইল নেই!</b>\n\n"
+            "নতুন একটি মেইল তৈরি করতে নিচের <b>📧 Create Mail</b> বাটনে চাপ দিন।",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard(user_id),
+        )
+        return
+
+    db_user = await get_or_create_user(user_id)
+    active = db_user.get("active_email")
+
+    keyboard_buttons = []
+    for item in saved:
+        is_curr = " (Active ✅)" if item["email"] == active else ""
+        button_text = f"✉️ {item['email']}{is_curr}"
+        keyboard_buttons.append([
+            InlineKeyboardButton(button_text, callback_data=f"switch_mail:{item['id']}", style="primary")
+        ])
+        
+    keyboard_buttons.append([
+        InlineKeyboardButton("❌ মেন্যু বন্ধ করুন", callback_data="close_menu", style="danger")
+    ])
+
+    reply_markup = InlineKeyboardMarkup(keyboard_buttons)
+    await update.message.reply_text(
+        "📁 <b>আপনার সেভ করা মেইলসমূহ (বিগত ১০ দিন):</b>\n\n"
+        "যেকোনো একটি মেইলে ক্লিক করলে সেটি <b>অ্যাক্টিভ</b> হবে এবং তার লাইভ ইনবক্স দেখতে পাবেন:",
+        reply_markup=reply_markup,
+        parse_mode=ParseMode.HTML,
+    )
+
+async def switch_mail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switches active email when user clicks a saved mail button"""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = update.effective_user.id
+    email_id = int(query.data.split(":")[1])
+    
+    email_record = await get_saved_email_by_id(email_id, user_id)
+    if not email_record:
+        await query.edit_message_text("❌ এই ইমেইলটি খুঁজে পাওয়া যায়নি বা মেয়াদ শেষ হয়ে গেছে।")
+        return
+
+    new_active_email = email_record["email"]
+    username = email_record["username"]
+    await set_active_email(user_id, new_active_email)
+    
+    web_url = make_web_url(username)
+    
+    # Fetch inbox for this switched email
+    async with httpx.AsyncClient() as client:
+        await sync_mailbox(client)
+        mails = await get_mailbox_messages(client, new_active_email)
+
+    inbox_preview = ""
+    if mails:
+        inbox_preview = f"\n\n📬 <b>ইনবক্সে {len(mails)} টি মেইল রয়েছে:</b>\n"
+        for i, m in enumerate(mails[:3], 1):
+            s_name = html.escape(m.get("sender_name") or m.get("sender_email") or "Unknown")
+            s_subj = html.escape(m.get("subject") or "(No Subject)")
+            inbox_preview += f"{i}. <b>{s_subj}</b> — <i>{s_name}</i>\n"
+    else:
+        inbox_preview = "\n\n📭 <i>ইনবক্স বর্তমানে খালি। নতুন মেইল আসলে অটোমেটিক নোটিফিকেশন পাবেন।</i>"
+
+    text = (
+        f"✅ <b>ইমেইল সফলভাবে পরিবর্তন করা হয়েছে!</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📧 <b>Active Email:</b> <code>{new_active_email}</code>\n"
+        f"🌐 <b>Web Link:</b> <a href=\"{web_url}\">Müllfach Postfach</a>"
+        f"{inbox_preview}"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 রিফ্রেশ ইনবক্স", callback_data="check_active_inbox", style="success")],
+        [InlineKeyboardButton("🌐 ওয়েব ভিউ", url=web_url)],
+    ])
+
+    await query.edit_message_text(
+        text,
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+# ────────────────────────────────────────────────────────────────
+# 📥 Current Inbox Handler (Current Email + Live Inbox)
+# ────────────────────────────────────────────────────────────────
+
+async def current_inbox_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays active email address and immediately checks/refreshes its inbox"""
+    user_id = update.effective_user.id
+    db_user = await get_or_create_user(user_id)
+    active_email = db_user.get("active_email")
+
+    if not active_email:
+        await update.message.reply_text(
+            "⚠️ <b>আপনার বর্তমানে কোনো অ্যাক্টিভ মেইল নেই!</b>\n\n"
+            "নতুন একটি মেইল তৈরি করতে উপরের <b>📧 Create Mail</b> বাটনে চাপুন।",
+            parse_mode=ParseMode.HTML,
+            reply_markup=get_main_keyboard(user_id),
+        )
+        return
+
+    username = active_email.split("@")[0]
+    web_url = make_web_url(username)
+    auto_status = "চালু আছে ✅" if db_user.get("auto_forward") == 1 else "বন্ধ আছে ❌"
+
+    status_msg = await update.message.reply_text(
+        f"🔄 <code>{active_email}</code> এর ইনবক্স চেক করা হচ্ছে...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    async with httpx.AsyncClient() as client:
+        await sync_mailbox(client)
+        mails = await get_mailbox_messages(client, active_email)
+
+    if not mails:
+        text = (
+            f"📥 <b>আপনার বর্তমান ইনবক্স:</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📧 <b>Active Email:</b> <code>{active_email}</code>\n"
+            f"<i>(ট্যাপ করলেই কপি হয়ে যাবে)</i>\n\n"
+            f"🌐 <b>Web Link:</b> <a href=\"{web_url}\">Müllfach Postfach</a>\n"
+            f"⚡ <b>অটো-ফরওয়ার্ড:</b> {auto_status}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📭 <i>ইনবক্স বর্তমানে খালি। কোনো ইমেইল বা কোড আসলে স্বয়ংক্রিয়ভাবে আপনাকে নোটিফিকেশন দেওয়া হবে।</i>"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Copy Email", copy_text=CopyTextButton(text=active_email), style="success")],
+            [InlineKeyboardButton("🔄 আবার চেক করুন", callback_data="check_active_inbox", style="primary")],
+            [InlineKeyboardButton("🌐 ওয়েবে দেখুন", url=web_url)],
+        ])
+        await status_msg.edit_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    # Mails found
+    text = (
+        f"📥 <b>আপনার বর্তমান ইনবক্স ({len(mails)} টি মেইল পাওয়া গেছে):</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📧 <b>Mailbox:</b> <code>{active_email}</code>\n"
+        f"🌐 <b>Web Link:</b> <a href=\"{web_url}\">Müllfach Postfach</a>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    buttons = [
+        [InlineKeyboardButton("📋 Copy Email", copy_text=CopyTextButton(text=active_email), style="success")]
+    ]
+    for m in mails[:10]:
+        mid = m["id"]
+        sender = m.get("sender_name") or m.get("sender_email") or "Unknown"
+        subject = m.get("subject") or "(No Subject)"
+        date_str = m.get("received_at", "")
+        item_code = (
+            await get_saved_otp(active_email, mid)
+            or extract_otp_code(subject)
+            or extract_otp_code(m.get("preview", ""))
+            or extract_otp_code(f"{sender} {subject}")
+        )
+
+        svc_name, svc_icon = detect_service_info(sender, subject, m.get("preview", ""))
+        icon = svc_icon if svc_name else ("🔑" if item_code else "📖")
+
+        display_subj = f"{icon} {subject[:18]}"
+
+        row = [InlineKeyboardButton(display_subj, callback_data=f"read_mail:{mid}", style="primary")]
+        if item_code:
+            row.append(InlineKeyboardButton(f"📋 {item_code}", copy_text=CopyTextButton(text=item_code), style="success"))
+        buttons.append(row)
+
+        s_name = html.escape(sender)
+        s_subj = html.escape(subject)
+        s_date = html.escape(date_str)
+        text += f"{icon} <b>{s_subj}</b>\n👤 প্রেরক: <code>{s_name}</code>\n⏰ সময়: {s_date}\n"
+        if item_code:
+            text += f"🔑 <b>কোড:</b> <code>{html.escape(item_code)}</code>\n"
+        text += "\n"
+
+    buttons.append([InlineKeyboardButton("🔄 রিফ্রেশ ইনবক্স", callback_data="check_active_inbox", style="primary")])
+    buttons.append([InlineKeyboardButton("🌐 ওয়েবে ফুল দেখুন", url=web_url)])
+
+    await status_msg.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+async def check_active_inbox_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Callback for quick inbox refresh"""
+    query = update.callback_query
+    await query.answer("ইনবক্স রিফ্রেশ করা হচ্ছে...")
+    user_id = update.effective_user.id
+    db_user = await get_or_create_user(user_id)
+    active_email = db_user.get("active_email")
+
+    if not active_email:
+        await query.edit_message_text("⚠️ আপনার কোনো সক্রিয় মেইল নেই।")
+        return
+
+    username = active_email.split("@")[0]
+    web_url = make_web_url(username)
+
+    async with httpx.AsyncClient() as client:
+        await sync_mailbox(client)
+        mails = await get_mailbox_messages(client, active_email)
+
+    if not mails:
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Copy Email", copy_text=CopyTextButton(text=active_email), style="success")],
+            [InlineKeyboardButton("🔄 আবার রিফ্রেশ", callback_data="check_active_inbox", style="primary")],
+            [InlineKeyboardButton("🌐 ওয়েবে দেখুন", url=web_url)],
+        ])
+        try:
+            await query.edit_message_text(
+                f"📭 <b>ইনবক্স এখনো খালি!</b>\n\n"
+                f"📧 <b>মেইল:</b> <code>{active_email}</code>\n"
+                f"<i>(ট্যাপ করলেই কপি হয়ে যাবে)</i>\n\n"
+                f"🌐 <b>ওয়েব:</b> <a href=\"{web_url}\">Postfach Link</a>\n\n"
+                f"অপেক্ষা করুন, নতুন ইমেইল আসলে বট সাথে সাথে আপনাকে পাঠিয়ে দেবে।",
+                reply_markup=keyboard,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                logger.warning(f"Error editing empty inbox: {e}")
+        return
+
+    text = (
+        f"📥 <b>আপনার বর্তমান ইনবক্স ({len(mails)} টি মেইল পাওয়া গেছে):</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📧 <b>Mailbox:</b> <code>{active_email}</code>\n"
+        f"🌐 <b>Web Link:</b> <a href=\"{web_url}\">Postfach Link</a>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    buttons = [
+        [InlineKeyboardButton("📋 Copy Email", copy_text=CopyTextButton(text=active_email), style="success")]
+    ]
+    for m in mails[:10]:
+        mid = m["id"]
+        sender = m.get("sender_name") or m.get("sender_email") or "Unknown"
+        subject = m.get("subject") or "(No Subject)"
+        date_str = m.get("received_at", "")
+        item_code = (
+            await get_saved_otp(active_email, mid)
+            or extract_otp_code(subject)
+            or extract_otp_code(m.get("preview", ""))
+            or extract_otp_code(f"{sender} {subject}")
+        )
+
+        svc_name, svc_icon = detect_service_info(sender, subject, m.get("preview", ""))
+        icon = svc_icon if svc_name else ("🔑" if item_code else "📖")
+
+        display_subj = f"{icon} {subject[:18]}"
+
+        row = [InlineKeyboardButton(display_subj, callback_data=f"read_mail:{mid}", style="primary")]
+        if item_code:
+            row.append(InlineKeyboardButton(f"📋 {item_code}", copy_text=CopyTextButton(text=item_code), style="success"))
+        buttons.append(row)
+
+        s_name = html.escape(sender)
+        s_subj = html.escape(subject)
+        s_date = html.escape(date_str)
+        text += f"{icon} <b>{s_subj}</b>\n👤 প্রেরক: <code>{s_name}</code>\n⏰ সময়: {s_date}\n"
+        if item_code:
+            text += f"🔑 <b>কোড:</b> <code>{html.escape(item_code)}</code>\n"
+        text += "\n"
+
+    buttons.append([InlineKeyboardButton("🔄 রিফ্রেশ", callback_data="check_active_inbox", style="primary")])
+    buttons.append([InlineKeyboardButton("🌐 ওয়েবে দেখুন", url=web_url)])
+
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            logger.warning(f"Error editing inbox message: {e}")
+
+async def read_mail_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays single mail details when user clicks Read button"""
+    query = update.callback_query
+    await query.answer()
+    
+    mail_id = int(query.data.split(":")[1])
+    user_id = update.effective_user.id
+    db_user = await get_or_create_user(user_id)
+    active_email = db_user.get("active_email")
+    target_email = await get_email_by_message_id(mail_id) or active_email
+
+    if not target_email:
+        await query.answer("কোনো অ্যাক্টিভ মেইল নেই!", show_alert=True)
+        return
+
+    async with httpx.AsyncClient() as client:
+        mail_data = await get_single_mail(client, target_email, mail_id)
+
+    if not mail_data:
+        await query.answer("মেইলের বিস্তারিত লোড করা সম্ভব হয়নি।", show_alert=True)
+        return
+
+    subject = mail_data.get("subject") or "(No Subject)"
+    sender = mail_data.get("sender_name") or mail_data.get("sender_email") or "Unknown"
+    date_str = mail_data.get("received_at", "")
+    
+    body_html = mail_data.get("body_html", "")
+    raw_body = mail_data.get("body_text") or strip_html_tags(body_html)
+    otp = (
+        await get_saved_otp(target_email, mail_id)
+        or extract_otp_code(subject)
+        or extract_otp_code(raw_body, html_content=body_html)
+        or extract_otp_code(f"{sender} {subject} {raw_body}", html_content=body_html)
+    )
+
+    service_name, service_icon = detect_service_info(sender, subject, raw_body)
+
+    header_title = f"{service_icon} <b>{service_name} ইমেইল বিবরণ:</b>" if service_name else "✉️ <b>ইমেইল বিবরণ:</b>"
+    code_label = f"{service_name} OTP" if service_name else "OTP / Code"
+
+    otp_section = ""
+    if otp:
+        otp_section = f"\n━━━━━━━━━━━━━━━━━━━━━\n🔑 <b>{code_label}:</b> <code>{html.escape(str(otp))}</code>\n"
+
+    # Truncate preview if too long
+    body_preview = raw_body[:1000] if raw_body else "(No text content)"
+
+    text = (
+        f"{header_title}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 <b>Subject:</b> <b>{html.escape(subject)}</b>\n"
+        f"👤 <b>From:</b> <code>{html.escape(sender)}</code>\n"
+        f"⏰ <b>Date:</b> {html.escape(date_str)}"
+        f"{otp_section}"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📄 <b>Message Content:</b>\n\n"
+        f"{html.escape(body_preview)}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━"
+    )
+
+    username = target_email.split("@")[0]
+    web_url = make_web_url(username)
+
+    keyboard_rows = []
+    if otp:
+        keyboard_rows.append([
+            InlineKeyboardButton(f"📋 {otp}", copy_text=CopyTextButton(text=otp), style="success")
+        ])
+    keyboard_rows.append([
+        InlineKeyboardButton("⬅️ ইনবক্স", callback_data="check_active_inbox", style="primary"),
+        InlineKeyboardButton("🌐 ওয়েবে ফুল দেখুন", url=web_url),
+    ])
+
+    keyboard = InlineKeyboardMarkup(keyboard_rows)
+
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=keyboard,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        plain_text = (
+            f"✉️ ইমেইল বিবরণ:\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📝 Subject: {subject}\n"
+            f"👤 From: {sender}\n"
+            f"⏰ Date: {date_str}\n"
+        )
+        if otp:
+            plain_text += f"━━━━━━━━━━━━━━━━━━━━━\n🔑 OTP / Code: {otp}\n"
+        plain_text += (
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"📄 Message Content:\n\n"
+            f"{body_preview}\n"
+            f"━━━━━━━━━━━━━━━━━━━━━"
+        )
+        await query.edit_message_text(
+            plain_text,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+
+# ────────────────────────────────────────────────────────────────
+# 🗑️ Delete Mailbox Handler
+# ────────────────────────────────────────────────────────────────
+
+async def delete_mailbox_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handles deletion of current active mailbox"""
+    user_id = update.effective_user.id
+    db_user = await get_or_create_user(user_id)
+    active_email = db_user.get("active_email")
+
+    if not active_email:
+        await update.message.reply_text(
+            "⚠️ আপনার বর্তমানে কোনো অ্যাক্টিভ মেইল নেই!",
+            reply_markup=get_main_keyboard(user_id),
+        )
+        return
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗑️ হ্যাঁ, ডিলিট করুন", callback_data=f"confirm_delete:{active_email}", style="danger"),
+            InlineKeyboardButton("❌ না, বাতিল", callback_data="close_menu", style="primary"),
+        ]
+    ])
+
+    await update.message.reply_text(
+        f"🗑️ <b>আপনি কি সত্যিই বর্তমান মেইলটি মুছে ফেলতে চান?</b>\n\n"
+        f"📧 <code>{active_email}</code>\n\n"
+        f"ডিলিট করলে এই মেইলের নোটিফিকেশন আর আসবে না।",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+
+async def confirm_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    email_to_delete = query.data.split(":", 1)[1]
+    
+    await delete_saved_email(user_id, email_to_delete)
+    await query.edit_message_text(
+        f"✅ <b>ইমেইলটি ডিলিট করা হয়েছে:</b> <code>{email_to_delete}</code>\n\n"
+        f"নতুন মেইল তৈরি করতে <b>📧 Create Mail</b> বাটনে চাপ দিন।",
+        parse_mode=ParseMode.HTML,
+    )
+
+# ────────────────────────────────────────────────────────────────
+# ⚙️ Setting Fuetch Handler
+# ────────────────────────────────────────────────────────────────
+
+async def setting_fuetch_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows settings menu"""
+    user_id = update.effective_user.id
+    db_user = await get_or_create_user(user_id)
+    auto_fwd = db_user.get("auto_forward", 1)
+    
+    auto_btn_text = "🔔 অটো-ফরওয়ার্ড: চালু ✅" if auto_fwd == 1 else "🔕 অটো-ফরওয়ার্ড: বন্ধ ❌"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(auto_btn_text, callback_data="toggle_autoforward", style="primary")],
+        [InlineKeyboardButton("🧹 ক্লিয়ার ১০-দিনের হিস্ট্রি", callback_data="confirm_clear_history", style="danger")],
+        [InlineKeyboardButton("ℹ️ About MailFuetch", callback_data="about_mailfuetch", style="primary")],
+        [InlineKeyboardButton("❌ মেন্যু বন্ধ করুন", callback_data="close_menu", style="danger")],
+    ])
+
+    await update.message.reply_text(
+        "⚙️ <b>MailFuetch Settings:</b>\n\n"
+        "নিচে থেকে আপনার পছন্দমতো সেটিংস পরিবর্তন করুন:",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+
+async def toggle_autoforward_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = update.effective_user.id
+    new_val = await toggle_auto_forward(user_id)
+    await query.answer(f"অটো-ফরওয়ার্ড {'চালু' if new_val == 1 else 'বন্ধ'} করা হয়েছে!")
+    
+    auto_btn_text = "🔔 অটো-ফরওয়ার্ড: চালু ✅" if new_val == 1 else "🔕 অটো-ফরওয়ার্ড: বন্ধ ❌"
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(auto_btn_text, callback_data="toggle_autoforward", style="primary")],
+        [InlineKeyboardButton("🧹 ক্লিয়ার ১০-দিনের হিস্ট্রি", callback_data="confirm_clear_history", style="danger")],
+        [InlineKeyboardButton("ℹ️ About MailFuetch", callback_data="about_mailfuetch", style="primary")],
+        [InlineKeyboardButton("❌ মেন্যু বন্ধ করুন", callback_data="close_menu", style="danger")],
+    ])
+    await query.edit_message_reply_markup(reply_markup=keyboard)
+
+async def about_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    about_text = (
+        f"🌐 <b>Müllfach.de — অফিশিয়াল ওয়েবসাইট প্ল্যাটফর্ম:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<b>Müllfach.de</b> হলো একটি আধুনিক, দ্রুত এবং অত্যন্ত বিশ্বস্ত ডিসপোজেবল টেম্পোরারি ইমেইল প্ল্যাটফর্ম। "
+        f"অনাকাঙ্ক্ষিত স্প্যাম, ফিশিং, ডেটা ট্র্যাকিং ও বিজ্ঞাপন থেকে আপনার ব্যক্তিগত ইমেইলকে সুরক্ষিত রাখতে এটি তৈরি করা হয়েছে।\n\n"
+        f"✨ <b>ওয়েবসাইটের মূল সুবিধাসমূহ:</b>\n"
+        f"• <b>১০০% ফ্রি ও কোনো পাসওয়ার্ড ছাড়াই:</b> কোনো প্রকার রেজিস্ট্রেশন বা ক্রেডিট কার্ড ছাড়াই তাৎক্ষণিক ইনবক্স অ্যাক্সেস।\n"
+        f"• <b>৩০ দিনের দীর্ঘস্থায়ী মেয়াদ:</b> অন্যান্য টেম্পোরারি মেইল সাইট যেখানে ১০-১৫ মিনিটে ইনবক্স মুছে দেয়, সেখানে Müllfach-এ মেইল ৩০ দিন পর্যন্ত সংরক্ষিত থাকে!\n"
+        f"• <b>হাই-স্পিড IMAP সিঙ্ক:</b> সরাসরি ডেডিকেটেড মেইল সার্ভারের সাথে লাইভ সংযোগ, ফলে ২ সেকেন্ডে মেসেজ ও ওটিপি চলে আসে।\n"
+        f"• <b>কাস্টম এড্রেস সাপোর্ট:</b> নিজের পছন্দের নাম বা ইউজারনেম দিয়ে যেকোনো সময় পোস্টফাক তৈরি করার স্বাধীনতা।\n"
+        f"• <b>অটো স্প্যাম ও ম্যালওয়্যার প্রোটেকশন:</b> নিরাপদ ব্রাউজিং ও ইনবক্স অভিজ্ঞতা।\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🔗 <b>অফিশিয়াল ওয়েবসাইট:</b> <a href=\"{MUELLFACH_BASE_URL}\">{MUELLFACH_BASE_URL}</a>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 ভিজিট ওয়েবসাইট", url=MUELLFACH_BASE_URL)],
+        [InlineKeyboardButton("⬅️ ব্যাক টু সেটিংস", callback_data="back_to_settings")],
+    ])
+    await query.edit_message_text(about_text, reply_markup=keyboard, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+async def clear_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚠️ হ্যাঁ, সব মুছুন", callback_data="do_clear_history", style="danger"),
+            InlineKeyboardButton("❌ বাতিল", callback_data="back_to_settings", style="primary"),
+        ]
+    ])
+    await query.edit_message_text(
+        "⚠️ <b>সতর্কতা:</b> আপনি কি সত্যিই আপনার সেভ করা সব মেইলের হিস্ট্রি মুছে ফেলতে চান?",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+
+async def do_clear_history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    await clear_all_saved_emails(user_id)
+    await query.edit_message_text("✅ আপনার সমস্ত সেভ করা মেইল হিস্ট্রি ক্লিয়ার করা হয়েছে!")
+
+async def back_to_settings_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    db_user = await get_or_create_user(user_id)
+    auto_fwd = db_user.get("auto_forward", 1)
+    auto_btn_text = "🔔 অটো-ফরওয়ার্ড: চালু ✅" if auto_fwd == 1 else "🔕 অটো-ফরওয়ার্ড: বন্ধ ❌"
+    
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(auto_btn_text, callback_data="toggle_autoforward", style="primary")],
+        [InlineKeyboardButton("🧹 ক্লিয়ার ১০-দিনের হিস্ট্রি", callback_data="confirm_clear_history", style="danger")],
+        [InlineKeyboardButton("ℹ️ About MailFuetch", callback_data="about_mailfuetch", style="primary")],
+        [InlineKeyboardButton("❌ মেন্যু বন্ধ করুন", callback_data="close_menu", style="danger")],
+    ])
+    await query.edit_message_text(
+        "⚙️ <b>MailFuetch Settings:</b>\n\nনিচে থেকে আপনার পছন্দমতো সেটিংস পরিবর্তন করুন:",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.HTML,
+    )
+
+async def close_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.delete_message()
+
+# ────────────────────────────────────────────────────────────────
+# 👑 Admin Panel Handlers (Authorized for ADMIN_ID: 8929349073)
+# ────────────────────────────────────────────────────────────────
+
+async def admin_panel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Opens Admin Panel for Authorized Admin with Live Analytics Summary"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ আপনি এই প্যানেলটি ব্যবহার করার জন্য অনুমোদিত নন।")
+        return
+
+    analytics = await get_live_analytics()
+    uptime_text = get_uptime_str()
+
+    admin_text = (
+        f"👑 <b>MailFuetch Admin Panel:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"স্বাগতম <b>{html.escape(user.first_name)}</b>! আপনার অ্যাডমিন ড্যাশবোর্ড সক্রিয় আছে।\n\n"
+        f"📊 <b>লাইভ সিস্টেম অ্যানালিটিক্স:</b>\n"
+        f"• 👥 মোট ইউজার সংখ্যা: <b>{analytics['total_users']}</b> জন\n"
+        f"• 🌟 আজকের সক্রিয় ইউজার: <b>{analytics['active_today']}</b> জন\n"
+        f"• ✉️ মোট তৈরি হওয়া মেইল: <b>{analytics['total_mails']}</b> টি\n"
+        f"• 🔑 আজকের রিসিভ হওয়া OTP কোড: <b>{analytics['today_otps']}</b> টি\n"
+        f"• 📬 আজকের মোট রিসিভ মেসেজ: <b>{analytics['today_messages']}</b> টি\n"
+        f"• ⚡ বর্তমানে অটো-লিসেনার সক্রিয়: <b>{analytics['listening_now']}</b> টি মেইলে\n"
+        f"• ⏳ একটানা লাইভ চলছে (Uptime): <b>{uptime_text}</b>\n"
+        f"• 🔄 এক ক্লিকে বট রিস্টার্ট ও আপডেট নোটিশ পাঠাতে <b>🔄 Restart Bot</b> চাপুন।\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"নিচের বাটনগুলো দিয়ে যেকোনো সেকশনে প্রবেশ করুন 👇"
+    )
+    await update.message.reply_text(
+        admin_text,
+        reply_markup=ADMIN_KEYBOARD,
+        parse_mode=ParseMode.HTML,
+    )
+
+async def admin_live_analytics_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Refreshes and displays live system analytics"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+
+    analytics = await get_live_analytics()
+    uptime_text = get_uptime_str()
+
+    text = (
+        f"📊 <b>MailFuetch লাইভ সিস্টেম অ্যানালিটিক্স:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>মোট ইউজার:</b> <b>{analytics['total_users']}</b> জন\n"
+        f"🌟 <b>আজকের সক্রিয় ইউজার:</b> <b>{analytics['active_today']}</b> জন\n"
+        f"✉️ <b>মোট তৈরি হওয়া ইমেইল:</b> <b>{analytics['total_mails']}</b> টি\n"
+        f"🔑 <b>আজকের মোট OTP কোড:</b> <b>{analytics['today_otps']}</b> টি\n"
+        f"📬 <b>আজকের মোট মেসেজ:</b> <b>{analytics['today_messages']}</b> টি\n"
+        f"⚡ <b>বর্তমানে রিয়েল-টাইম লিসেনিং:</b> <b>{analytics['listening_now']}</b> টি মেইলে\n"
+        f"⏳ <b>একটানা লাইভ চলছে (Uptime):</b> <b>{uptime_text}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+
+async def admin_backup_db_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends current SQLite database file to Admin directly in chat"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+
+    if not os.path.exists(DB_PATH):
+        await update.message.reply_text("❌ ডাটাবেজ ফাইল পাওয়া যায়নি!", reply_markup=ADMIN_KEYBOARD)
+        return
+
+    status_msg = await update.message.reply_text("⏳ ডাটাবেজ ব্যাকআপ তৈরি হচ্ছে...")
+
+    file_size_kb = os.path.getsize(DB_PATH) / 1024
+    size_str = f"{file_size_kb:.1f} KB" if file_size_kb < 1024 else f"{(file_size_kb/1024):.2f} MB"
+    timestamp_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    backup_filename = f"mailfuetch_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+
+    try:
+        with open(DB_PATH, "rb") as db_file:
+            caption = (
+                f"💾 <b>MailFuetch Database Backup</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"📅 তারিখ ও সময়: <code>{timestamp_str}</code>\n"
+                f"📦 ফাইল সাইজ: <b>{size_str}</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                f"<i>এই ফাইলটিতে সমস্ত ইউজার ও সেভ করা মেইলের রেকর্ড সংরক্ষিত আছে।</i>"
+            )
+            await context.bot.send_document(
+                chat_id=user.id,
+                document=db_file,
+                filename=backup_filename,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+            )
+        await status_msg.delete()
+    except Exception as e:
+        await status_msg.edit_text(f"❌ ব্যাকআপ ফাইল পাঠাতে সমস্যা হয়েছে: {e}")
+
+async def admin_back_to_user_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switches back to user main menu"""
+    user = update.effective_user
+    await update.message.reply_text(
+        "🔙 <b>ইউজার মেন্যুতে ফিরে যাওয়া হয়েছে।</b>",
+        reply_markup=get_main_keyboard(user.id),
+        parse_mode=ParseMode.HTML,
+    )
+
+async def admin_users_list_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays user list with total emails and daily codes/messages"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+
+    status_msg = await update.message.reply_text("⏳ ইউজার ডেটা প্রস্তুত করা হচ্ছে...")
+    users = await get_all_users_stats()
+    
+    if not users:
+        await status_msg.edit_text("📭 ডাটাবেজে এখনো কোনো ইউজার নেই।")
+        return
+
+    header = f"👥 <b>সকল ইউজারের তালিকা (মোট: {len(users)} জন):</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    chunks = []
+    current_chunk = header
+    
+    for idx, u in enumerate(users, 1):
+        uname = f"@{u['username']}" if u['username'] else "No Username"
+        fname = html.escape(u['first_name'])
+        entry = (
+            f"<b>{idx}. {fname}</b> ({uname})\n"
+            f"   🆔 ID: <code>{u['user_id']}</code>\n"
+            f"   ✉️ মোট মেইল তৈরি: <b>{u['total_mails']}</b> টি\n"
+            f"   🔑 আজকের কোড: <b>{u['daily_codes']}</b> টি | আজকের মেসেজ: <b>{u['daily_messages']}</b> টি\n"
+            f"   📦 সর্বমোট মেসেজ: <b>{u['total_messages']}</b> টি\n"
+            f"   📧 সক্রিয় মেইল: <code>{html.escape(u['active_email'])}</code>\n"
+            f"   ─────────────────────\n"
+        )
+        if len(current_chunk) + len(entry) > 3800:
+            chunks.append(current_chunk)
+            current_chunk = entry
+        else:
+            current_chunk += entry
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    await status_msg.delete()
+    for chunk in chunks:
+        await update.message.reply_text(chunk, parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+
+async def admin_top_users_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Displays top 10 users ranked by mail creation and messages received"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return
+
+    top_users = await get_top_users(10)
+    if not top_users:
+        await update.message.reply_text("📭 ডাটাবেজে কোনো ইউজার অ্যাক্টিভিটি পাওয়া যায়নি।", reply_markup=ADMIN_KEYBOARD)
+        return
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    
+    text = "🏆 <b>টপ ১০ ইউজার র‍্যাংকিং:</b>\n━━━━━━━━━━━━━━━━━━━━━\n\n"
+    for idx, u in enumerate(top_users):
+        medal = medals[idx] if idx < len(medals) else f"#{idx+1}"
+        uname = f"@{u['username']}" if u['username'] else "No Username"
+        fname = html.escape(u['first_name'])
+        text += (
+            f"{medal} <b>{fname}</b> ({uname})\n"
+            f"   🆔 ID: <code>{u['user_id']}</code>\n"
+            f"   ✉️ তৈরি করা মেইল: <b>{u['total_mails']}</b> টি\n"
+            f"   📬 মোট প্রাপ্ত মেসেজ: <b>{u['total_messages']}</b> টি (🔑 কোড: <b>{u['total_codes']}</b> টি)\n\n"
+        )
+    text += "━━━━━━━━━━━━━━━━━━━━━"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=ADMIN_KEYBOARD)
+
+async def admin_broadcast_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompts admin to enter broadcast message"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "📢 <b>সকল ইউজারের কাছে ব্রডকাস্ট মেসেজ পাঠান:</b>\n\n"
+        "যে মেসেজটি পাঠাতে চান তা নিচে লিখে রিপ্লাই দিন:\n\n"
+        "<i>(বাতিল করতে চাইলে /cancel লিখুন)</i>",
+        parse_mode=ParseMode.HTML,
+    )
+    return WAITING_BROADCAST
+
+async def admin_broadcast_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends the broadcast message to all users"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    broadcast_text = update.message.text
+    user_ids = await get_all_user_ids()
+
+    if not user_ids:
+        await update.message.reply_text("📭 কোনো ইউজার পাওয়া যায়নি।", reply_markup=ADMIN_KEYBOARD)
+        return ConversationHandler.END
+
+    status_msg = await update.message.reply_text(f"🚀 ব্রডকাস্ট শুরু হচ্ছে... মোট ইউজার: {len(user_ids)} জন")
+
+    success = 0
+    failed = 0
+
+    formatted_msg = (
+        f"📢 <b>অফিশিয়াল নোটিফিকেশন:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{html.escape(broadcast_text)}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🤖 <i>MailFuetch Bot Team</i>"
+    )
+
+    for uid in user_ids:
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=formatted_msg,
+                parse_mode=ParseMode.HTML,
+            )
+            success += 1
+            await asyncio.sleep(0.04)
+        except Exception:
+            failed += 1
+
+    await status_msg.edit_text(
+        f"✅ <b>ব্রডকাস্ট সম্পন্ন হয়েছে!</b>\n\n"
+        f"• মোট ইউজার: {len(user_ids)} জন\n"
+        f"• সফলভাবে পৌঁছেছে: <b>{success}</b> জন\n"
+        f"• ব্যর্থ/ব্লক করেছে: <b>{failed}</b> জন",
+        parse_mode=ParseMode.HTML,
+    )
+    return ConversationHandler.END
+
+async def admin_direct_msg_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompts admin to send direct message to a specific user"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "💬 <b>নির্দিষ্ট ইউজারকে মেসেজ পাঠান:</b>\n\n"
+        "নিচের ফরম্যাটে ইউজার আইডি এবং মেসেজটি লিখুন:\n"
+        "<code>USER_ID: আপনার মেসেজ</code>\n\n"
+        "💡 <i>যেমন:</i>\n"
+        "<code>8929349073: আপনার সমস্যা সমাধান করা হয়েছে।</code>\n\n"
+        "❌ বাতিল করতে /cancel লিখুন।",
+        parse_mode=ParseMode.HTML,
+    )
+    return WAITING_DIRECT_MSG
+
+async def admin_direct_msg_process(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Sends direct message to specified user"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    raw_text = update.message.text.strip()
+    if ":" not in raw_text:
+        await update.message.reply_text(
+            "❌ <b>ভুল ফরম্যাট!</b>\n\n"
+            "অনুগ্রহ করে <code>USER_ID: মেসেজ</code> এভাবে লিখুন (মাঝখানে কোলন : দিতে হবে)।\n\n"
+            "আবার চেষ্টা করুন অথবা /cancel লিখুন:",
+            parse_mode=ParseMode.HTML,
+        )
+        return WAITING_DIRECT_MSG
+
+    parts = raw_text.split(":", 1)
+    target_id_str = parts[0].strip()
+    msg_content = parts[1].strip()
+
+    if not target_id_str.isdigit():
+        await update.message.reply_text(
+            "❌ ইউজার আইডিটি শুধুমাত্র সংখ্যা হতে হবে! আবার লিখুন:",
+            parse_mode=ParseMode.HTML,
+        )
+        return WAITING_DIRECT_MSG
+
+    target_uid = int(target_id_str)
+    
+    send_text = (
+        f"💬 <b>অ্যাডমিন থেকে বার্তা:</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{html.escape(msg_content)}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"<i>প্রয়োজনে মেসেজের উত্তর দিতে পারেন।</i>"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text=send_text,
+            parse_mode=ParseMode.HTML,
+        )
+        await update.message.reply_text(
+            f"✅ <b>মেসেজ সফলভাবে পৌঁছেছে!</b>\n\n"
+            f"👤 ইউজার আইডি: <code>{target_uid}</code>\n"
+            f"📝 মেসেজ: {html.escape(msg_content)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ADMIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ <b>মেসেজ পাঠানো সম্ভব হয়নি!</b>\n\n"
+            f"কারণ: <code>{html.escape(str(e))}</code>\n\n"
+            f"<i>(হয়তো ইউজার বটটি কখনো স্টার্ট করেনি বা বট ব্লক করে রেখেছে)</i>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ADMIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+
+async def cancel_admin_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels ongoing broadcast or direct message action"""
+    await update.message.reply_text("❌ অপারেশন বাতিল করা হয়েছে।", reply_markup=ADMIN_KEYBOARD)
+    return ConversationHandler.END
+
+async def admin_restart_bot_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Restarts the bot with 1 click and notifies all active users"""
+    user = update.effective_user
+    if user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ আপনি এই অ্যাকশনটি চালানোর জন্য অনুমোদিত নন।")
+        return
+
+    status_msg = await update.message.reply_text(
+        "⏳ <b>বট রিস্টার্ট প্রক্রিয়া শুরু হচ্ছে...</b>\n\n"
+        "সমস্ত রেজিস্টার্ড ইউজারদের নোটিফিকেশন পাঠানো হচ্ছে, অনুগ্রহ করে একটু অপেক্ষা করুন...",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # 1. Fetch all users
+    user_ids = await get_all_user_ids()
+    notified_count = 0
+
+    notice_msg = (
+        "📢 <b>সিস্টেম আপডেট নোটিফিকেশন:</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🛠️ <b>বটের সিস্টেম আপডেট চলছে!</b>\n\n"
+        "অনুগ্রহ করে একটু অপেক্ষা করুন। খুব দ্রুতই সমস্ত সার্ভিস স্বয়ংক্রিয়ভাবে আবার সচল হয়ে যাবে।\n\n"
+        "ধন্যবাদ আপনার ধৈর্য্যের জন্য! ❤️\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "🤖 <i>MailFuetch Pro Team</i>"
+    )
+
+    # Send notice to all users except the admin (admin gets live status)
+    for uid in user_ids:
+        if uid == ADMIN_ID:
+            continue
+        try:
+            await context.bot.send_message(
+                chat_id=uid,
+                text=notice_msg,
+                parse_mode=ParseMode.HTML,
+            )
+            notified_count += 1
+            await asyncio.sleep(0.04)  # Rate limit protection (25 msgs/sec)
+        except Exception:
+            pass
+
+    await status_msg.edit_text(
+        f"✅ <b>মোট {notified_count} জন ইউজারকে আপডেট নোটিশ পাঠানো হয়েছে!</b>\n\n"
+        f"🔄 <b>বট এখন রিস্টার্ট নিচ্ছে...</b>\n"
+        f"কয়েক সেকেন্ডের মধ্যে নতুন প্রসেসে বট স্বয়ংক্রিয়ভাবে চালু হয়ে যাবে।",
+        parse_mode=ParseMode.HTML,
+    )
+
+    async def do_restart():
+        await asyncio.sleep(1.5)  # Telegram delivery buffer
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            logger.error(f"os.execv failed: {e}. Falling back to sys.exit(0)")
+            sys.exit(0)
+
+    asyncio.create_task(do_restart())
+
+# ────────────────────────────────────────────────────────────────
+# 🚀 Real-time Background Polling Task (2-3 Seconds Polling)
+# ────────────────────────────────────────────────────────────────
+
+async def background_inbox_poller(app: Application):
+    """Polls muellfach.de every 2-3 seconds for active users and forwards new mails"""
+    logger.info("Real-time auto-inbox poller started.")
+    
+    timeout_cfg = httpx.Timeout(5.0, connect=2.5)
+    async with httpx.AsyncClient(timeout=timeout_cfg) as client:
+        while True:
+            try:
+                # 1. Fetch all users who have an active email and auto_forward enabled
+                active_users = await get_active_users_to_poll()
+                if not active_users:
+                    await asyncio.sleep(POLL_INTERVAL)
+                    continue
+
+                # 2. Trigger IMAP sync on muellfach server to pull incoming emails
+                await sync_mailbox(client)
+
+                # Group user_ids by active_email
+                email_to_users = {}
+                for uid, email in active_users:
+                    if email not in email_to_users:
+                        email_to_users[email] = []
+                    email_to_users[email].append(uid)
+
+                # 3. Check inbox for each unique active email in parallel
+                sem = asyncio.Semaphore(15)
+
+                async def process_user_mailbox(email: str, uids: list[int]):
+                    async with sem:
+                        try:
+                            mails = await get_mailbox_messages(client, email)
+                            if not mails:
+                                return
+
+                            # Process in arrival order (oldest first, newest last) like real SMS
+                            for mail_item in reversed(mails):
+                                mid = mail_item.get("id")
+                                if not mid:
+                                    continue
+
+                                already_seen = await is_message_seen(email, mid)
+                                if already_seen:
+                                    continue
+
+                                # Fetch full mail details with fast timeout so OTP is never delayed
+                                try:
+                                    full_mail = await asyncio.wait_for(get_single_mail(client, email, mid), timeout=1.5)
+                                except Exception:
+                                    full_mail = None
+                                if full_mail:
+                                    subject = full_mail.get("subject") or "(No Subject)"
+                                    sender = (
+                                        full_mail.get("sender_name")
+                                        or full_mail.get("sender_email")
+                                        or "Unknown"
+                                    )
+                                    date_str = full_mail.get("received_at", "")
+                                    body_raw = full_mail.get("body_text") or strip_html_tags(
+                                        full_mail.get("body_html", "")
+                                    )
+                                    body_html = full_mail.get("body_html", "")
+                                else:
+                                    # Fallback to mail_item data so email is never lost!
+                                    subject = mail_item.get("subject") or "(No Subject)"
+                                    sender = (
+                                        mail_item.get("sender_name")
+                                        or mail_item.get("sender_email")
+                                        or "Unknown"
+                                    )
+                                    date_str = mail_item.get("received_at", "")
+                                    body_raw = mail_item.get("preview", "")
+                                    body_html = ""
+
+                                # Universal multi-stage OTP detection across all services worldwide
+                                otp = (
+                                    extract_otp_code(subject)
+                                    or extract_otp_code(body_raw, html_content=body_html)
+                                    or extract_otp_code(mail_item.get("preview", ""))
+                                    or extract_otp_code(f"{sender} {subject} {body_raw}", html_content=body_html)
+                                )
+
+                                # Smart Service Name and Icon Detection for clean branding
+                                service_name, service_icon = detect_service_info(sender, subject, body_raw)
+
+                                if service_name and otp:
+                                    title_header = f"{service_icon} <b>{service_name} ভেরিফিকেশন কোড এসেছে!</b>"
+                                    code_title = f"{service_name} OTP"
+                                elif otp:
+                                    title_header = "🔑 <b>ভেরিফিকেশন কোড (OTP) এসেছে!</b>"
+                                    code_title = "OTP / Code"
+                                elif service_name:
+                                    title_header = f"{service_icon} <b>{service_name} থেকে নতুন মেইল এসেছে!</b>"
+                                    code_title = "Code"
+                                else:
+                                    title_header = "📬 <b>নতুন ইমেইল এসেছে!</b>"
+                                    code_title = "OTP / Code"
+
+                                otp_section = ""
+                                if otp:
+                                    otp_section = (
+                                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"🔑 <b>{code_title}:</b> <code>{html.escape(str(otp))}</code>\n"
+                                        f"<i>(নিচের বাটনে ট্যাপ করলেই কোড কপি হবে)</i>\n"
+                                    )
+
+                                body_snippet = (
+                                    body_raw[:600] if body_raw else ("(No content)" if full_mail else "(Loading preview... click Read Details)")
+                                )
+
+                                username = email.split("@")[0]
+                                web_url = make_web_url(username)
+
+                                sender_esc = html.escape(str(sender))
+                                subject_esc = html.escape(str(subject))
+                                email_esc = html.escape(str(email))
+                                date_esc = html.escape(str(date_str))
+                                body_esc = html.escape(str(body_snippet))
+
+                                msg_text = (
+                                    f"{title_header}\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"📧 <b>To:</b> <code>{email_esc}</code>\n"
+                                    f"👤 <b>From:</b> <code>{sender_esc}</code>\n"
+                                    f"📝 <b>Subject:</b> <b>{subject_esc}</b>\n"
+                                    f"⏰ <b>Time:</b> {date_esc}\n"
+                                    f"{otp_section}"
+                                    f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                    f"📄 <b>Message Preview:</b>\n\n"
+                                    f"{body_esc}\n"
+                                    f"━━━━━━━━━━━━━━━━━━━━━"
+                                )
+
+                                keyboard_rows = []
+                                if otp:
+                                    keyboard_rows.append([
+                                        InlineKeyboardButton(
+                                            f"📋 {otp}",
+                                            copy_text=CopyTextButton(text=otp),
+                                            style="success",
+                                        )
+                                    ])
+                                keyboard_rows.append([
+                                    InlineKeyboardButton(
+                                        "📖 বিস্তারিত",
+                                        callback_data=f"read_mail:{mid}",
+                                        style="primary",
+                                    ),
+                                    InlineKeyboardButton("🌐 ওয়েবে দেখুন", url=web_url),
+                                ])
+
+                                keyboard = InlineKeyboardMarkup(keyboard_rows)
+
+                                # Forward to each user listening to this email
+                                sent_any = False
+                                for uid in uids:
+                                    try:
+                                        await app.bot.send_message(
+                                            chat_id=uid,
+                                            text=msg_text,
+                                            reply_markup=keyboard,
+                                            parse_mode=ParseMode.HTML,
+                                            disable_web_page_preview=True,
+                                        )
+                                        sent_any = True
+                                    except Exception as send_err:
+                                        logger.warning(f"HTML send failed for user {uid}: {send_err}. Falling back to plain text...")
+                                        try:
+                                            plain_msg = (
+                                                f"📬 নতুন ইমেইল এসেছে!\n"
+                                                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                                f"📧 To: {email}\n"
+                                                f"👤 From: {sender}\n"
+                                                f"📝 Subject: {subject}\n"
+                                                f"⏰ Time: {date_str}\n"
+                                            )
+                                            if otp:
+                                                plain_msg += f"━━━━━━━━━━━━━━━━━━━━━\n🔑 OTP / Code: {otp}\n"
+                                            plain_msg += (
+                                                f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                                f"📄 Message Preview:\n\n"
+                                                f"{body_snippet}\n"
+                                                f"━━━━━━━━━━━━━━━━━━━━━"
+                                            )
+                                            await app.bot.send_message(
+                                                chat_id=uid,
+                                                text=plain_msg,
+                                                reply_markup=keyboard,
+                                                disable_web_page_preview=True,
+                                            )
+                                            sent_any = True
+                                        except Exception as plain_err:
+                                            logger.error(f"Error sending plain text mail to user {uid}: {plain_err}")
+
+                                # Mark as seen with extracted OTP for persistence
+                                if sent_any:
+                                    await mark_message_seen(email, mid, otp=otp)
+                                    for uid in uids:
+                                        await log_user_message(uid, email, mid, has_otp=(1 if otp else 0))
+
+                        except Exception as email_err:
+                            logger.error(f"Error polling email {email}: {email_err}")
+
+                tasks = [process_user_mailbox(em, us) for em, us in email_to_users.items()]
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            except Exception as e:
+                logger.error(f"Error in background_inbox_poller loop: {e}")
+
+            await asyncio.sleep(POLL_INTERVAL)
+
+async def poller_supervisor(app: Application):
+    """Supervises the inbox poller so it automatically recovers from any unexpected errors"""
+    while True:
+        try:
+            await background_inbox_poller(app)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"background_inbox_poller crashed: {e}. Restarting poller in 5s...", exc_info=True)
+            await asyncio.sleep(5)
+
+# ────────────────────────────────────────────────────────────────
+# Lightweight Health Check Server (For Render Web Service Port Binding)
+# ────────────────────────────────────────────────────────────────
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
-        self.wfile.write(b"VookMail Telegram Bot is Running 24/7 Live on Render!")
+        self.wfile.write(b"MailFuetch Bot is running live!")
 
     def do_HEAD(self):
         self.send_response(200)
-        self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
 
     def log_message(self, format, *args):
-        pass  # Suppress HTTP access logs to keep terminal logs clean
+        # Suppress HTTP log noise in Render console
+        pass
 
-def run_render_web_server():
-    """Runs a lightweight HTTP server to satisfy Render Free Web Service port binding."""
+def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     try:
-        server = HTTPServer(("0.0.0.0", port), RenderHealthHandler)
-        print(f"🌐 [Render Health Server] Listening on port {port} (Status: Live)")
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        logger.info(f"Health server successfully listening on port {port}")
         server.serve_forever()
     except Exception as e:
-        print(f"⚠️ [Render Server Error] {e}")
+        logger.error(f"Health server error on port {port}: {e}")
 
-# ----------------- Keyboard & UI Helpers -----------------
-
-def get_copy_button(text_to_copy: str) -> types.InlineKeyboardButton:
-    """Returns native Telegram copy button for email address."""
-    try:
-        if hasattr(types, "CopyTextButton"):
-            return types.InlineKeyboardButton("📋 Copy Mail", copy_text=types.CopyTextButton(text=text_to_copy))
-    except Exception:
-        pass
-    return types.InlineKeyboardButton("📋 Copy Mail", callback_data=f"copy_{text_to_copy}")
-
-def get_code_copy_button(code: str) -> types.InlineKeyboardButton:
-    """Returns an inline button displaying JUST the code with NO emoji."""
-    clean_code = str(code).strip()
-    try:
-        if hasattr(types, "CopyTextButton"):
-            return types.InlineKeyboardButton(clean_code, copy_text=types.CopyTextButton(text=clean_code))
-    except Exception:
-        pass
-    return types.InlineKeyboardButton(clean_code, callback_data=f"copycode_{clean_code}")
-
-def get_main_keyboard(user_id: int):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn_create = types.KeyboardButton("📧 Create Mail")
-    btn_login = types.KeyboardButton("🔑 Login Mail")
-    btn_domain = types.KeyboardButton("🌐 Domain")
-    btn_service = types.KeyboardButton("⚡ Service Select")
-    btn_history = types.KeyboardButton("📜 History")
-    btn_support = types.KeyboardButton("💬 Support")
-    
-    markup.add(btn_create, btn_login)
-    markup.add(btn_domain, btn_service)
-    markup.add(btn_history, btn_support)
-    
-    if is_admin(user_id):
-        btn_admin = types.KeyboardButton("👑 Admin Panel")
-        markup.add(btn_admin)
-        
-    return markup
-
-def build_all_domains_markup(current_domain: str):
-    domain_data = vook_client.get_domains_data()
-    groups = domain_data.get("groups", VOOK_GROUPS)
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-
-    is_auto = not current_domain or current_domain.lower() in ("auto", "default", "")
-    auto_text = "⚡ Auto / Random (Website Default) ✅" if is_auto else "⚡ Auto / Random (Website Default)"
-    markup.add(types.InlineKeyboardButton(auto_text, callback_data="setdom_auto"))
-
-    for g in groups:
-        cat_header = f"── {g.get('icon', '📁')} {g.get('name', 'Domains')} ──"
-        markup.add(types.InlineKeyboardButton(cat_header, callback_data="noop"))
-        
-        row = []
-        for d in g.get("domains", []):
-            clean_d = d.lstrip('@')
-            is_selected = (clean_d == current_domain)
-            label = f"@{clean_d} ✅" if is_selected else f"@{clean_d}"
-            row.append(types.InlineKeyboardButton(label, callback_data=f"setdom_{clean_d}"))
-            if len(row) == 2:
-                markup.add(row[0], row[1])
-                row = []
-        if row:
-            markup.add(row[0])
-
-    return markup
-
-def build_services_markup(current_service: str):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-
-    is_auto = not current_service or current_service.lower() in ("auto", "general", "general / auto", "")
-    auto_text = "⚡ Auto / General (Default) ✅" if is_auto else "⚡ Auto / General (Default)"
-    markup.add(types.InlineKeyboardButton(auto_text, callback_data="setserv_auto"))
-
-    row = []
-    for item in VOOK_SERVICES:
-        name = item["name"]
-        icon = item["icon"]
-        is_selected = (name.lower() == (current_service or "").lower())
-        label = f"{icon} {name} ✅" if is_selected else f"{icon} {name}"
-        row.append(types.InlineKeyboardButton(label, callback_data=f"setserv_{name}"))
-        if len(row) == 2:
-            markup.add(row[0], row[1])
-            row = []
-    if row:
-        markup.add(row[0])
-
-    return markup
-
-def build_message_markup(address: str, msg_id: str, code: str = "", link: str = "") -> types.InlineKeyboardMarkup:
-    markup = types.InlineKeyboardMarkup()
-    if code:
-        markup.add(get_code_copy_button(code))
-
-    if link:
-        markup.add(
-            types.InlineKeyboardButton("🔗 Open Link", url=link),
-            types.InlineKeyboardButton("📖 View Full Message", callback_data=f"view_{address}_{msg_id}")
-        )
-    else:
-        markup.add(types.InlineKeyboardButton("📖 View Full Message", callback_data=f"view_{address}_{msg_id}"))
-
-    return markup
-
-def build_admin_panel_markup() -> types.InlineKeyboardMarkup:
-    m_active = is_maintenance_active()
-    m_status_btn = "⚙️ Mnt: ON 🔴" if m_active else "⚙️ Mnt: OFF 🟢"
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.add(types.InlineKeyboardButton("📋 User Live Activities", callback_data="adm_activities"))
-    markup.add(
-        types.InlineKeyboardButton("🔍 Search User", callback_data="adm_search_user"),
-        types.InlineKeyboardButton(m_status_btn, callback_data="adm_toggle_maintenance")
-    )
-    markup.add(
-        types.InlineKeyboardButton("📢 Broadcast", callback_data="adm_broadcast"),
-        types.InlineKeyboardButton("🔑 Set API Key", callback_data="adm_setkey")
-    )
-    markup.add(
-        types.InlineKeyboardButton("💬 Set Support ID", callback_data="adm_setsupport"),
-        types.InlineKeyboardButton("🚫 Ban/Unban User", callback_data="adm_ban")
-    )
-    markup.add(
-        types.InlineKeyboardButton("🔄 Refresh Stats", callback_data="adm_refresh"),
-        types.InlineKeyboardButton("⚡ Restart Bot", callback_data="adm_restart_bot")
-    )
-    return markup
-
-# ----------------- Start / Help Handlers -----------------
-
-@bot.message_handler(commands=['start'])
-def handle_start(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
-    first_name = message.from_user.first_name or ""
-
-    if is_maintenance_active() and not is_admin(user_id):
-        bot.reply_to(message, "⚠️ <b>বটের কাজ চলছে (Maintenance Mode)</b>\n\nকিছুক্ষণের মধ্যেই বট পুনরায় চালু করা হবে। অনুগ্রহ করে একটু পর চেষ্টা করুন।")
+async def keep_alive_pinger():
+    """Pings external Render URL every 10 minutes to prevent free-tier spin down"""
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not render_url:
         return
-
-    if database.is_banned(user_id):
-        bot.reply_to(message, "⛔ You are suspended from using this bot.")
-        return
-
-    database.register_user(user_id=user_id, username=username, first_name=first_name)
-    database.log_activity(user_id, username, first_name, "START_BOT", "Started the bot")
-
-    user = database.get_user(user_id) or {}
-    saved_domain = user.get("selected_domain") or "Auto / Random"
-    saved_service = user.get("selected_service") or "General / Auto"
-
-    welcome_text = (
-        f"👋 <b>Welcome, {first_name}!</b>\n\n"
-        f"🔥 <b>VookMail Temporary Email Bot</b>-এ আপনাকে স্বাগতম!\n\n"
-        f"📌 <b>বর্তমান ডোমেইন:</b> <code>@{saved_domain}</code>\n"
-        f"🎯 <b>বর্তমান সার্ভিস:</b> <code>{saved_service}</code>\n\n"
-        f"নিচের মেনু বোতামগুলো ব্যবহার করে কাজ করুন:\n"
-        f"• <b>📧 Create Mail:</b> তাৎক্ষণিক নতুন ইমেইল তৈরি করুন।\n"
-        f"• <b>🔑 Login Mail:</b> আগের ব্যবহৃত মেইল অ্যাড্রেস দিয়ে ইনবক্স ওপেন করুন।\n"
-        f"• <b>🌐 Domain:</b> ৩৬টি ডোমেইন থেকে পছন্দের ডোমেইন বেছে নিন।\n"
-        f"• <b>⚡ Service Select:</b> ফেসবুক, টেলিগ্রাম, ChatGPT ইত্যাদি সার্ভিস বেছে নিন।\n"
-        f"• <b>📜 History:</b> আপনার আগের সব ইমেইল দেখুন ও ইনবক্স চেক করুন।\n"
-        f"• <b>💬 Support:</b> সরাসরি এডমিনকে মেসেজ পাঠাতে ক্লিক করুন।"
-    )
-    bot.send_message(message.chat.id, welcome_text, reply_markup=get_main_keyboard(user_id))
-
-# ----------------- 📧 Create Mail Handler -----------------
-
-@bot.message_handler(func=lambda msg: msg.text == "📧 Create Mail")
-def handle_create_mail(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
-    first_name = message.from_user.first_name or ""
-
-    if is_maintenance_active() and not is_admin(user_id):
-        bot.reply_to(message, "⚠️ <b>বটের কাজ চলছে (Maintenance Mode)</b>\nঅনুগ্রহ করে একটু পর চেষ্টা করুন।")
-        return
-
-    if database.is_banned(user_id):
-        return
-
-    user = database.get_user(user_id) or {}
-    selected_domain = user.get("selected_domain", "")
-    target_domain = selected_domain if (selected_domain and selected_domain.lower() != "auto") else None
-    service = user.get("selected_service") or "General / Auto"
-
-    wait_msg = bot.send_message(message.chat.id, "⏳ <i>Generating your email address...</i>")
-
-    res = vook_client.create_mailbox(domain=target_domain)
-    if not res.get("success"):
-        err = res.get("error", "Unknown error")
-        bot.edit_message_text(
-            f"❌ <b>Error creating mail:</b> {err}",
-            chat_id=message.chat.id,
-            message_id=wait_msg.message_id
-        )
-        return
-
-    data = res["data"]
-    address = data.get("address", "")
-    token = data.get("token", "")
-    cookie = data.get("cookie", "")
-    expires_at = data.get("expires_at", "24 Hours")
-
-    database.add_mail_history(
-        user_id=user_id,
-        email=address,
-        token=token,
-        cookie=cookie,
-        service=service,
-        expires_at=str(expires_at)
-    )
-
-    database.log_activity(user_id, username, first_name, "CREATE_MAIL", f"{address} ({service})")
-
-    mail_domain_display = address.split("@")[1] if "@" in address else (selected_domain or "Auto")
-
-    mail_text = (
-        f"✨ <b>New Temporary Mail Created!</b>\n\n"
-        f"📬 <b>Email:</b> <code>{address}</code>\n"
-        f"🌐 <b>Domain:</b> <code>@{mail_domain_display}</code>\n"
-        f"🎯 <b>Service:</b> <code>{service}</code>\n"
-        f"⏳ <b>Validity:</b> <code>{expires_at}</code>"
-    )
-
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    btn_copy = get_copy_button(address)
-    btn_check = types.InlineKeyboardButton("🔄 Check Inbox", callback_data=f"chk_{address}")
-    btn_del = types.InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{address}")
-    
-    markup.add(btn_copy)
-    markup.add(btn_check, btn_del)
-
-    bot.edit_message_text(mail_text, chat_id=message.chat.id, message_id=wait_msg.message_id, reply_markup=markup)
-
-# ----------------- 🔑 Login Mail Handler -----------------
-
-@bot.message_handler(func=lambda msg: msg.text == "🔑 Login Mail")
-def handle_login_mail(message):
-    user_id = message.from_user.id
-    if is_maintenance_active() and not is_admin(user_id):
-        bot.reply_to(message, "⚠️ <b>বটের কাজ চলছে (Maintenance Mode)</b>\nঅনুগ্রহ করে একটু পর চেষ্টা করুন।")
-        return
-
-    if database.is_banned(user_id):
-        return
-
-    USER_STATES[user_id] = "awaiting_login_email"
-
-    text = (
-        f"🔑 <b>Login to Existing Mailbox</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"আপনার পূর্বে ব্যবহৃত সম্পূর্ণ ইমেইল অ্যাড্রেসটি লিখে সেন্ড করুন:\n"
-        f"(উদাহরণ: <code>user482@lockomail.com</code>)"
-    )
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_login"))
-
-    bot.send_message(message.chat.id, text, reply_markup=markup)
-
-# ----------------- 🌐 Domain Handler -----------------
-
-@bot.message_handler(func=lambda msg: msg.text == "🌐 Domain")
-def handle_domain(message):
-    user_id = message.from_user.id
-    if is_maintenance_active() and not is_admin(user_id):
-        bot.reply_to(message, "⚠️ <b>বটের কাজ চলছে (Maintenance Mode)</b>\nঅনুগ্রহ করে একটু পর চেষ্টা করুন।")
-        return
-
-    if database.is_banned(user_id):
-        return
-
-    user = database.get_user(user_id) or {}
-    current = user.get("selected_domain") or ""
-    current_display = current if current and current.lower() != "auto" else "Auto / Random (Website Default)"
-
-    text = (
-        f"🌐 <b>VookMail Domain Selection</b>\n\n"
-        f"📌 <b>বর্তমান সেভ থাকা ডোমেইন:</b> <code>@{current_display}</code>\n\n"
-        f"নিচের তালিকা থেকে আপনার পছন্দের ডোমেইনটি বেছে নিন:"
-    )
-    markup = build_all_domains_markup(current)
-    bot.send_message(message.chat.id, text, reply_markup=markup)
-
-# ----------------- ⚡ Service Select Handler -----------------
-
-@bot.message_handler(func=lambda msg: msg.text == "⚡ Service Select")
-def handle_service_select(message):
-    user_id = message.from_user.id
-    if is_maintenance_active() and not is_admin(user_id):
-        bot.reply_to(message, "⚠️ <b>বটের কাজ চলছে (Maintenance Mode)</b>\nঅনুগ্রহ করে একটু পর চেষ্টা করুন।")
-        return
-
-    if database.is_banned(user_id):
-        return
-
-    user = database.get_user(user_id) or {}
-    current = user.get("selected_service") or "General / Auto"
-
-    text = (
-        f"⚡ <b>VookMail Service Selection</b>\n\n"
-        f"🎯 <b>বর্তমান সেভ থাকা সার্ভিস:</b> <code>{current}</code>\n\n"
-        f"যে সার্ভিসের জন্য ইমেইল ব্যবহার করবেন সেটি বেছে নিন:"
-    )
-    markup = build_services_markup(current)
-    bot.send_message(message.chat.id, text, reply_markup=markup)
-
-# ----------------- 📜 History Handler -----------------
-
-@bot.message_handler(func=lambda msg: msg.text == "📜 History")
-def handle_history(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
-    first_name = message.from_user.first_name or ""
-
-    if is_maintenance_active() and not is_admin(user_id):
-        bot.reply_to(message, "⚠️ <b>বটের কাজ চলছে (Maintenance Mode)</b>\nঅনুগ্রহ করে একটু পর চেষ্টা করুন।")
-        return
-
-    if database.is_banned(user_id):
-        return
-
-    database.log_activity(user_id, username, first_name, "VIEW_HISTORY", "Viewed mail history")
-
-    history = database.get_user_history(user_id, limit=8)
-    if not history:
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("❌ Close", callback_data="hist_close"))
-        bot.send_message(message.chat.id, "ℹ️ আপনার কোনো পূর্ববর্তী ইমেইল হিস্ট্রি পাওয়া যায়নি। '📧 Create Mail' চাপুন।", reply_markup=markup)
-        return
-
-    text = "📜 <b>আপনার স্থায়ী ইমেইল হিস্ট্রি:</b>\n"
-    text += "━━━━━━━━━━━━━━━━━━\n"
-
-    markup = types.InlineKeyboardMarkup(row_width=1)
-
-    for idx, item in enumerate(history, 1):
-        email = item["email"]
-        service = item.get("service") or "General"
-        date = item.get("created_at", "")[:16]
-        text += f"<b>{idx}.</b> <code>{email}</code>\n   ↳ 🎯 <i>{service}</i> | 📅 {date}\n\n"
-        markup.add(types.InlineKeyboardButton(f"📥 Check Inbox: {email[:18]}...", callback_data=f"chk_{email}"))
-
-    btn_clear = types.InlineKeyboardButton("🗑️ Clear History", callback_data="hist_clear")
-    btn_close = types.InlineKeyboardButton("❌ Cancel / Close", callback_data="hist_close")
-    markup.row(btn_clear, btn_close)
-
-    bot.send_message(message.chat.id, text, reply_markup=markup)
-
-# ----------------- 💬 Support Handler -----------------
-
-@bot.message_handler(func=lambda msg: msg.text == "💬 Support")
-def handle_support(message):
-    user_id = message.from_user.id
-    if database.is_banned(user_id):
-        return
-
-    USER_STATES[user_id] = "awaiting_support_text"
-
-    text = (
-        f"💬 <b>Support & Help Desk</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"আপনার কোনো সমস্যা, মতামত বা সাহায্যের প্রয়োজন হলে নিচে মেসেজটি লিখে সেন্ড করুন।"
-    )
-
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data="cancel_support"))
-
-    bot.send_message(message.chat.id, text, reply_markup=markup)
-
-# ----------------- 👑 Admin Panel Handler -----------------
-
-@bot.message_handler(func=lambda msg: msg.text == "👑 Admin Panel")
-def handle_admin_panel(message):
-    user_id = message.from_user.id
-    if not is_admin(user_id):
-        bot.send_message(message.chat.id, "⛔ You are not authorized to view this panel.")
-        return
-
-    stats = database.get_stats()
-    m_active = is_maintenance_active()
-
-    text = (
-        f"👑 <b>Admin Control Panel</b>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"👥 <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
-        f"📧 <b>Total Emails Created:</b> <code>{stats['total_mails']}</code>\n"
-        f"📋 <b>Total Logged Actions:</b> <code>{stats.get('total_logs', 0)}</code>\n"
-        f"🚫 <b>Banned Users:</b> <code>{stats['banned_users']}</code>\n"
-        f"⚙️ <b>Maintenance Mode:</b> <code>{'ENABLED 🔴' if m_active else 'DISABLED 🟢'}</code>\n"
-        f"🔑 <b>API Key Status:</b> <code>{'Configured ✅' if vook_client.get_api_key() else 'Direct Live Engine ⚡'}</code>"
-    )
-
-    bot.send_message(message.chat.id, text, reply_markup=build_admin_panel_markup())
-
-# ----------------- Inline Callbacks -----------------
-
-@bot.callback_query_handler(func=lambda call: True)
-def handle_callbacks(call):
-    user_id = call.from_user.id
-    username = call.from_user.username or ""
-    first_name = call.from_user.first_name or ""
-    data = call.data
-
-    if is_maintenance_active() and not is_admin(user_id):
-        bot.answer_callback_query(call.id, "⚠️ বটের কাজ চলছে (Maintenance Mode)", show_alert=True)
-        return
-
-    if data == "noop":
-        bot.answer_callback_query(call.id)
-        return
-
-    if data.startswith("copy_"):
-        address = data.split("copy_")[1]
-        bot.answer_callback_query(call.id, f"📋 {address}\n(Copied!)", show_alert=True)
-        return
-
-    if data.startswith("copycode_"):
-        code = data.split("copycode_")[1]
-        bot.answer_callback_query(call.id, f"{code}", show_alert=True)
-        return
-
-    if data == "cancel_login":
-        USER_STATES.pop(user_id, None)
-        bot.answer_callback_query(call.id, "Cancelled.")
-        try:
-            bot.edit_message_text("❌ লগইন বাতিল করা হয়েছে।", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
-        except Exception:
-            pass
-        return
-
-    if data == "cancel_support":
-        USER_STATES.pop(user_id, None)
-        bot.answer_callback_query(call.id, "Cancelled.")
-        try:
-            bot.edit_message_text("❌ বাতিল করা হয়েছে।", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
-        except Exception:
-            pass
-        return
-
-    if data == "hist_clear":
-        database.clear_user_history(user_id)
-        database.log_activity(user_id, username, first_name, "CLEAR_HISTORY", "Cleared email history")
-        bot.answer_callback_query(call.id, "History cleared!")
-        try:
-            bot.edit_message_text(
-                "🗑️ <b>আপনার সকল ইমেইল হিস্ট্রি সফলভাবে মুছে ফেলা হয়েছে!</b>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=None
-            )
-        except Exception:
-            pass
-        return
-
-    if data == "hist_close":
-        bot.answer_callback_query(call.id, "Closed")
-        try:
-            bot.delete_message(chat_id=call.message.chat.id, message_id=call.message.message_id)
-        except Exception:
+    logger.info(f"Keep-alive pinger active for: {render_url}")
+    async with httpx.AsyncClient() as client:
+        while True:
+            await asyncio.sleep(600)  # Ping every 10 mins (Render sleeps after 15 mins)
             try:
-                bot.edit_message_text("❌ হিস্ট্রি বন্ধ করা হয়েছে।", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
+                r = await client.get(render_url, timeout=10.0)
+                logger.info(f"Keep-alive ping status: {r.status_code}")
+            except Exception as e:
+                logger.debug(f"Keep-alive ping error: {e}")
+
+# ────────────────────────────────────────────────────────────────
+# Application Startup and Main
+# ────────────────────────────────────────────────────────────────
+
+async def post_init(application: Application):
+    """Initializes database, sets command menu to only /start, and spawns background polling worker"""
+    await init_db()
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Start the bot")
+        ])
+    except Exception as e:
+        logger.warning(f"Could not set bot commands: {e}")
+    asyncio.create_task(poller_supervisor(application))
+    asyncio.create_task(keep_alive_pinger())
+
+def main():
+    if not BOT_TOKEN:
+        print("\n" + "=" * 60)
+        print("❌ ERROR: BOT_TOKEN is not set!")
+        print("Please set your BOT_TOKEN in the '.env' file or in config.py")
+        print("Example: BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz")
+        print("=" * 60 + "\n")
+        return
+
+    # Start health check server in background thread for Render Web Service
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # Build Telegram application
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # 1. Admin Conversation Handlers
+    broadcast_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^📢 Broadcast$"), admin_broadcast_prompt),
+            CommandHandler("broadcast", admin_broadcast_prompt),
+        ],
+        states={
+            WAITING_BROADCAST: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_process)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_admin_action)],
+    )
+    app.add_handler(broadcast_conv)
+
+    direct_msg_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^💬 Send to User$"), admin_direct_msg_prompt),
+            CommandHandler("send", admin_direct_msg_prompt),
+        ],
+        states={
+            WAITING_DIRECT_MSG: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_direct_msg_process)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_admin_action)],
+    )
+    app.add_handler(direct_msg_conv)
+
+    # 1.1 User Login Account Conversation Handler
+    login_acc_conv = ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex(r"^(🔑 Login Acc|Login Acc|/login)$"), login_acc_prompt),
+            CommandHandler("login", login_acc_prompt),
+        ],
+        states={
+            WAITING_LOGIN_INPUT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, login_acc_process)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_login_acc)],
+    )
+    app.add_handler(login_acc_conv)
+
+    # 2. Admin Action Handlers
+    app.add_handler(CommandHandler("admin", admin_panel_handler))
+    app.add_handler(CommandHandler("backup", admin_backup_db_handler))
+    app.add_handler(CommandHandler("restart", admin_restart_bot_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^(👑 Admin Panel|/admin)$"), admin_panel_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^📊 Live Analytics$"), admin_live_analytics_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^👥 Users List$"), admin_users_list_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^🏆 Top (10 )?Users$"), admin_top_users_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^💾 Database Backup$"), admin_backup_db_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔄 Restart Bot$"), admin_restart_bot_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"^🔙 Back to User Menu$"), admin_back_to_user_menu))
+
+    # 3. Email Creation Handlers (1-Click)
+    app.add_handler(CommandHandler(["create", "new"], create_mail_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"(Create Mail|Custom Email)"), create_mail_handler))
+    app.add_handler(CallbackQueryHandler(create_mail_handler, pattern=r"^quick_create_mail$"))
+
+    # 4. Main Menu Button Handlers
+    app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(MessageHandler(filters.Regex(r"(Current Inbox|Current Email|Refresh Inbox)"), current_inbox_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"Saved Mails"), saved_mails_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"Delete Mailbox"), delete_mailbox_handler))
+    app.add_handler(MessageHandler(filters.Regex(r"Setting Fuetch"), setting_fuetch_handler))
+
+    # 3. Callback Handlers
+    app.add_handler(CallbackQueryHandler(switch_mail_callback, pattern=r"^switch_mail:\d+$"))
+    app.add_handler(CallbackQueryHandler(check_active_inbox_callback, pattern=r"^check_active_inbox$"))
+    app.add_handler(CallbackQueryHandler(read_mail_callback, pattern=r"^read_mail:\d+$"))
+    app.add_handler(CallbackQueryHandler(confirm_delete_callback, pattern=r"^confirm_delete:.+$"))
+    app.add_handler(CallbackQueryHandler(toggle_autoforward_callback, pattern=r"^toggle_autoforward$"))
+    app.add_handler(CallbackQueryHandler(about_callback, pattern=r"^about_mailfuetch$"))
+    app.add_handler(CallbackQueryHandler(clear_history_callback, pattern=r"^confirm_clear_history$"))
+    app.add_handler(CallbackQueryHandler(do_clear_history_callback, pattern=r"^do_clear_history$"))
+    app.add_handler(CallbackQueryHandler(back_to_settings_callback, pattern=r"^back_to_settings$"))
+    app.add_handler(CallbackQueryHandler(close_menu_callback, pattern=r"^close_menu$"))
+
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        err_msg = str(context.error)
+        if "Message is not modified" in err_msg:
+            return  # Benign Telegram error when refresh button is tapped with identical inbox content
+        logger.error("Exception while handling an update:", exc_info=context.error)
+        if isinstance(update, Update) and update.effective_message:
+            try:
+                await update.effective_message.reply_text(
+                    "⚠️ দুঃখিত, কোনো সমস্যা হয়েছে। অনুগ্রহ করে আবার চেষ্টা করুন।"
+                )
             except Exception:
                 pass
-        return
 
-    # Check Inbox
-    if data.startswith("chk_"):
-        address = data.split("chk_")[1]
-        database.log_activity(user_id, username, first_name, "CHECK_INBOX", address)
+    app.add_error_handler(error_handler)
 
-        mail_row = database.get_mail_by_address(address) or {}
-        token = mail_row.get("token")
-        cookie = mail_row.get("cookie")
-
-        res = vook_client.get_messages(address, token=token, cookie=cookie)
-        if not res.get("success"):
-            bot.answer_callback_query(call.id, f"Error: {res.get('error')}", show_alert=True)
-            return
-
-        messages = res.get("messages", [])
-        if not messages:
-            bot.answer_callback_query(call.id, "📭 Inbox is empty.", show_alert=True)
-            return
-
-        bot.answer_callback_query(call.id, f"📬 {len(messages)} message(s) found!")
-        for msg in messages:
-            sender = msg.get("from", "Unknown")
-            subject = msg.get("subject", "No Subject")
-            code = msg.get("verification_code", "") or msg.get("code", "")
-            link = msg.get("verification_link", "") or msg.get("link", "")
-            msg_id = msg.get("id", "")
-
-            msg_text = (
-                f"📨 <b>New Message Received!</b>\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"📬 <b>To:</b> <code>{address}</code>\n"
-                f"👤 <b>From:</b> <code>{sender}</code>\n"
-                f"📝 <b>Subject:</b> <b>{subject}</b>\n"
-            )
-
-            if code:
-                msg_text += f"\n🔑 <b>Verification Code:</b> <code>{code}</code>\n"
-            if link:
-                msg_text += f"\n🔗 <b>Verification Link:</b> <a href=\"{link}\">Click Here</a>\n"
-
-            msg_markup = build_message_markup(address=address, msg_id=msg_id, code=code, link=link)
-            bot.send_message(call.message.chat.id, msg_text, reply_markup=msg_markup)
-
-    # View Single Message Detail
-    elif data.startswith("view_"):
-        parts = data.split("_")
-        if len(parts) >= 3:
-            address = parts[1]
-            msg_id = parts[2]
-            mail_row = database.get_mail_by_address(address) or {}
-            res = vook_client.get_message_detail(address, msg_id, token=mail_row.get("token"), cookie=mail_row.get("cookie"))
-            if res.get("success"):
-                item = res["data"]
-                body = item.get("text") or item.get("snippet") or "No text content"
-                if len(body) > 3000:
-                    body = body[:3000] + "\n...(truncated)"
-                bot.send_message(call.message.chat.id, f"📄 <b>Message Body:</b>\n\n<pre>{body}</pre>")
-            else:
-                bot.answer_callback_query(call.id, "Could not fetch message detail", show_alert=True)
-
-    # Delete Mailbox
-    elif data.startswith("del_"):
-        address = data.split("del_")[1]
-        mail_row = database.get_mail_by_address(address) or {}
-        vook_client.delete_mailbox(address, token=mail_row.get("token"), cookie=mail_row.get("cookie"))
-        database.log_activity(user_id, username, first_name, "DELETE_MAIL", address)
-        bot.answer_callback_query(call.id, "🗑️ Mailbox deleted successfully!")
-        try:
-            bot.edit_message_text(f"🗑️ Mailbox <code>{address}</code> has been deleted.", chat_id=call.message.chat.id, message_id=call.message.message_id)
-        except Exception:
-            pass
-
-    # Domain Select
-    elif data.startswith("setdom_"):
-        chosen = data.split("setdom_")[1]
-        if chosen in ("auto", "default"):
-            database.set_user_domain(user_id, "")
-            database.log_activity(user_id, username, first_name, "SELECT_DOMAIN", "Auto / Random")
-            bot.answer_callback_query(call.id, "✅ Set to: Auto / Random")
-            success_text = "✅ <b>Domain Selected Successfully!</b>\n\n📌 <b>Saved Domain:</b> <code>⚡ Auto / Website Default</code>"
-        else:
-            database.set_user_domain(user_id, chosen)
-            database.log_activity(user_id, username, first_name, "SELECT_DOMAIN", f"@{chosen}")
-            bot.answer_callback_query(call.id, f"✅ @{chosen} selected!")
-            success_text = f"✅ <b>Domain Selected Successfully!</b>\n\n📌 <b>Saved Domain:</b> <code>@{chosen}</code>"
-
-        try:
-            bot.edit_message_text(success_text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
-        except Exception:
-            pass
-
-    # Service Select
-    elif data.startswith("setserv_"):
-        chosen = data.split("setserv_")[1]
-        if chosen in ("auto", "general"):
-            database.set_user_service(user_id, "General / Auto")
-            database.log_activity(user_id, username, first_name, "SELECT_SERVICE", "General / Auto")
-            bot.answer_callback_query(call.id, "✅ Set to: Auto / General")
-            serv_text = "✅ <b>Service Selected Successfully!</b>\n\n🎯 <b>Saved Service:</b> <code>⚡ Auto / General (Default)</code>"
-        else:
-            database.set_user_service(user_id, chosen)
-            database.log_activity(user_id, username, first_name, "SELECT_SERVICE", chosen)
-            bot.answer_callback_query(call.id, f"✅ Service set to {chosen}")
-            serv_text = f"✅ <b>Service Selected Successfully!</b>\n\n🎯 <b>Saved Service:</b> <code>{chosen}</code>"
-            
-        try:
-            bot.edit_message_text(serv_text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=None)
-        except Exception:
-            pass
-
-    # Admin: Toggle Maintenance Mode
-    elif data == "adm_toggle_maintenance":
-        if not is_admin(user_id):
-            return
-        current_m = is_maintenance_active()
-        new_m = "0" if current_m else "1"
-        database.set_setting("maintenance_mode", new_m)
-        status_word = "ACTIVATED 🔴" if new_m == "1" else "DEACTIVATED 🟢"
-        bot.answer_callback_query(call.id, f"Maintenance Mode {status_word}")
-
-        stats = database.get_stats()
-        text = (
-            f"👑 <b>Admin Control Panel</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"👥 <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
-            f"📧 <b>Total Emails Created:</b> <code>{stats['total_mails']}</code>\n"
-            f"📋 <b>Total Logged Actions:</b> <code>{stats.get('total_logs', 0)}</code>\n"
-            f"🚫 <b>Banned Users:</b> <code>{stats['banned_users']}</code>\n"
-            f"⚙️ <b>Maintenance Mode:</b> <code>{'ENABLED 🔴' if new_m == '1' else 'DISABLED 🟢'}</code>\n"
-            f"🔑 <b>API Key Status:</b> <code>{'Configured ✅' if vook_client.get_api_key() else 'Direct Live Engine ⚡'}</code>"
-        )
-        try:
-            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=build_admin_panel_markup())
-        except Exception:
-            pass
-
-    # Admin: Search User
-    elif data == "adm_search_user":
-        if not is_admin(user_id):
-            return
-        USER_STATES[user_id] = "awaiting_search_user_id"
-        bot.send_message(call.message.chat.id, "🔍 ইউজারের <b>Telegram User ID</b> লিখুন:\n(বাতিল করতে /cancel লিখুন)")
-        bot.answer_callback_query(call.id)
-
-    # Admin: View User Live Activities
-    elif data in ("adm_activities", "adm_act_refresh"):
-        if not is_admin(user_id):
-            return
-        
-        logs = database.get_recent_activity_logs(limit=15)
-        text = "📋 <b>User Live Activities (সর্বশেষ ১৫টি অ্যাকশন):</b>\n"
-        text += "━━━━━━━━━━━━━━━━━━\n"
-
-        if not logs:
-            text += "<i>এখনো কোনো রেকর্ড পাওয়া যায়নি।</i>"
-        else:
-            for idx, log in enumerate(logs, 1):
-                u_name = log.get("first_name") or log.get("username") or str(log.get("user_id"))
-                uid = log.get("user_id")
-                action = log.get("action", "")
-                details = log.get("details", "")
-                timestamp = str(log.get("created_at", ""))[-8:]
-
-                action_badge = action
-                if action == "CREATE_MAIL": action_badge = "📧 Create Mail"
-                elif action == "LOGIN_MAIL": action_badge = "🔑 Login Mail"
-                elif action == "SELECT_DOMAIN": action_badge = "🌐 Domain"
-                elif action == "SELECT_SERVICE": action_badge = "⚡ Service"
-                elif action == "CHECK_INBOX": action_badge = "📥 Check Inbox"
-                elif action == "SUPPORT_MSG": action_badge = "💬 Support Msg"
-                elif action == "START_BOT": action_badge = "🚀 Started"
-                elif action == "CLEAR_HISTORY": action_badge = "🗑️ Clear History"
-
-                text += f"<b>{idx}.</b> 👤 <b>{u_name}</b> (<code>{uid}</code>)\n   ↳ <i>{action_badge}: {details}</i> | 🕒 {timestamp}\n\n"
-
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        markup.add(
-            types.InlineKeyboardButton("🔄 Refresh Logs", callback_data="adm_act_refresh"),
-            types.InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_refresh")
-        )
-
-        try:
-            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup)
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id, "Logs Updated!")
-
-    # Admin: 1-Click Bot Restart
-    elif data == "adm_restart_bot":
-        if not is_admin(user_id):
-            return
-        
-        bot.answer_callback_query(call.id, "Restarting bot...")
-        database.set_setting("restart_chat_id", str(call.message.chat.id))
-        
-        try:
-            bot.edit_message_text(
-                "🔄 <b>বট রিস্টার্ট হচ্ছে...</b>\n<i>কয়েক সেকেন্ডের মধ্যে বট পুনরায় চালু হয়ে নোটিফিকেশন দেবে।</i>",
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                reply_markup=None
-            )
-        except Exception:
-            pass
-
-        def execute_restart():
-            time.sleep(1)
-            os.execv(sys.executable, [sys.executable] + sys.argv)
-
-        threading.Thread(target=execute_restart).start()
-
-    # Admin: Toggle Ban from user profile
-    elif data.startswith("admtoggleban_"):
-        if not is_admin(user_id):
-            return
-        target_uid = int(data.split("admtoggleban_")[1])
-        new_ban = 0 if database.is_banned(target_uid) else 1
-        database.set_ban_status(target_uid, new_ban)
-        bot.answer_callback_query(call.id, f"User {target_uid} is now {'Banned' if new_ban else 'Unbanned'}!")
-
-    # Admin: Reply directly to a support user
-    elif data.startswith("admreply_"):
-        if not is_admin(user_id):
-            return
-        target_uid = int(data.split("admreply_")[1])
-        USER_STATES[user_id] = f"replying_user_{target_uid}"
-        bot.send_message(call.message.chat.id, f"✍️ User <code>{target_uid}</code>-কে রিপ্লাই পাঠান:\n(বাতিল করতে /cancel লিখুন)")
-        bot.answer_callback_query(call.id)
-
-    # Admin: Refresh Stats
-    elif data == "adm_refresh":
-        if not is_admin(user_id):
-            return
-        stats = database.get_stats()
-        m_active = is_maintenance_active()
-        text = (
-            f"👑 <b>Admin Control Panel</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"👥 <b>Total Users:</b> <code>{stats['total_users']}</code>\n"
-            f"📧 <b>Total Emails Created:</b> <code>{stats['total_mails']}</code>\n"
-            f"📋 <b>Total Logged Actions:</b> <code>{stats.get('total_logs', 0)}</code>\n"
-            f"🚫 <b>Banned Users:</b> <code>{stats['banned_users']}</code>\n"
-            f"⚙️ <b>Maintenance Mode:</b> <code>{'ENABLED 🔴' if m_active else 'DISABLED 🟢'}</code>\n"
-            f"🔑 <b>API Key Status:</b> <code>{'Configured ✅' if vook_client.get_api_key() else 'Direct Live Engine ⚡'}</code>"
-        )
-        try:
-            bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=build_admin_panel_markup())
-        except Exception:
-            pass
-        bot.answer_callback_query(call.id, "Refreshed!")
-
-    # Admin: Broadcast
-    elif data == "adm_broadcast":
-        if not is_admin(user_id):
-            return
-        USER_STATES[user_id] = "awaiting_broadcast"
-        bot.send_message(call.message.chat.id, "📢 ব্রডকাস্ট মেসেজটি লিখুন:\n(বাতিল করতে /cancel লিখুন)")
-        bot.answer_callback_query(call.id)
-
-    # Admin: Set API Key
-    elif data == "adm_setkey":
-        if not is_admin(user_id):
-            return
-        USER_STATES[user_id] = "awaiting_api_key"
-        bot.send_message(call.message.chat.id, "🔑 VookMail API Key (<code>vk_...</code>) সেন্ড করুন:\n(বাতিল করতে /cancel লিখুন)")
-        bot.answer_callback_query(call.id)
-
-    # Admin: Set Support
-    elif data == "adm_setsupport":
-        if not is_admin(user_id):
-            return
-        USER_STATES[user_id] = "awaiting_support"
-        bot.send_message(call.message.chat.id, "💬 নতুন সাপোর্ট আইডি লিখুন:\n(বাতিল করতে /cancel লিখুন)")
-        bot.answer_callback_query(call.id)
-
-    # Admin: Ban User
-    elif data == "adm_ban":
-        if not is_admin(user_id):
-            return
-        USER_STATES[user_id] = "awaiting_ban_id"
-        bot.send_message(call.message.chat.id, "🚫 যাকে Ban/Unban করতে চান তার <b>User ID</b> লিখুন:\n(বাতিল করতে /cancel লিখুন)")
-        bot.answer_callback_query(call.id)
-
-# ----------------- Interactive State Handler (User & Admin) -----------------
-
-@bot.message_handler(func=lambda msg: msg.from_user.id in USER_STATES)
-def handle_user_states(message):
-    user_id = message.from_user.id
-    username = message.from_user.username or ""
-    first_name = message.from_user.first_name or ""
-    state = USER_STATES.get(user_id)
-
-    if message.text == "/cancel":
-        USER_STATES.pop(user_id, None)
-        bot.reply_to(message, "❌ অ্যাকশন বাতিল করা হয়েছে।", reply_markup=get_main_keyboard(user_id))
-        return
-
-    # Admin: Search User ID Lookup
-    if state == "awaiting_search_user_id":
-        USER_STATES.pop(user_id, None)
-        target_str = message.text.strip()
-        if not target_str.isdigit():
-            bot.reply_to(message, "❌ ইনভ্যালিড আইডি। সংখ্যা হতে হবে।", reply_markup=get_main_keyboard(user_id))
-            return
-
-        target_uid = int(target_str)
-        user_info = database.get_user(target_uid)
-        if not user_info:
-            bot.reply_to(message, f"❌ User <code>{target_uid}</code>-কে ডাটাবেজে পাওয়া যায়নি।", reply_markup=get_main_keyboard(user_id))
-            return
-
-        user_history = database.get_user_history(target_uid, limit=5)
-        ban_status = "BANNED ⛔" if user_info.get("is_banned") else "ACTIVE ✅"
-
-        info_text = (
-            f"🔍 <b>User Profile & Analytics</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🆔 <b>User ID:</b> <code>{target_uid}</code>\n"
-            f"👤 <b>Name:</b> {user_info.get('first_name', 'N/A')}\n"
-            f"🔗 <b>Username:</b> @{user_info.get('username') or 'NoUsername'}\n"
-            f"📅 <b>Joined:</b> {user_info.get('created_at', '')[:19]}\n"
-            f"🌐 <b>Saved Domain:</b> <code>@{user_info.get('selected_domain') or 'Auto'}</code>\n"
-            f"🎯 <b>Saved Service:</b> <code>{user_info.get('selected_service') or 'General'}</code>\n"
-            f"🚦 <b>Status:</b> <b>{ban_status}</b>\n"
-            f"📧 <b>Total Recent Mails:</b> <code>{len(user_history)}</code>\n\n"
-        )
-
-        if user_history:
-            info_text += "<b>সাম্প্রতিক মেইলসমূহ:</b>\n"
-            for h in user_history:
-                info_text += f"• <code>{h['email']}</code> ({h.get('service', 'General')})\n"
-
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        btn_ban = types.InlineKeyboardButton("🚫 Toggle Ban", callback_data=f"admtoggleban_{target_uid}")
-        btn_dm = types.InlineKeyboardButton("💬 Send DM", callback_data=f"admreply_{target_uid}")
-        btn_back = types.InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_refresh")
-        markup.add(btn_ban, btn_dm)
-        markup.add(btn_back)
-
-        bot.send_message(message.chat.id, info_text, reply_markup=markup)
-
-    # User Login to Existing Mail
-    elif state == "awaiting_login_email":
-        USER_STATES.pop(user_id, None)
-        target_email = message.text.strip().lower()
-
-        if not re.match(r"^[^@]+@[^@]+\.[^@]+$", target_email):
-            bot.reply_to(
-                message,
-                "❌ <b>ইনভ্যালিড ইমেইল ফরম্যাট!</b>\nসঠিক ইমেইল দিন (যেমন: <code>user123@lockomail.com</code>)।",
-                reply_markup=get_main_keyboard(user_id)
-            )
-            return
-
-        wait_msg = bot.send_message(message.chat.id, "🔍 <i>Checking mailbox status...</i>")
-
-        mail_row = database.get_mail_by_address(target_email) or {}
-        res = vook_client.get_messages(target_email, token=mail_row.get("token"), cookie=mail_row.get("cookie"))
-        
-        if res.get("success"):
-            database.add_mail_history(
-                user_id=user_id,
-                email=target_email,
-                token=mail_row.get("token", ""),
-                cookie=mail_row.get("cookie", ""),
-                service="Logged In",
-                expires_at="Active"
-            )
-
-            database.log_activity(user_id, username, first_name, "LOGIN_MAIL", target_email)
-
-            target_domain = target_email.split("@")[1] if "@" in target_email else ""
-
-            login_text = (
-                f"✨ <b>Mailbox Logged In Successfully!</b>\n\n"
-                f"📬 <b>Email:</b> <code>{target_email}</code>\n"
-                f"🌐 <b>Domain:</b> <code>@{target_domain}</code>\n"
-                f"🎯 <b>Status:</b> <code>Active Inbox</code>"
-            )
-
-            markup = types.InlineKeyboardMarkup(row_width=2)
-            btn_copy = get_copy_button(target_email)
-            btn_check = types.InlineKeyboardButton("🔄 Check Inbox", callback_data=f"chk_{target_email}")
-            btn_del = types.InlineKeyboardButton("🗑️ Delete", callback_data=f"del_{target_email}")
-            markup.add(btn_copy)
-            markup.add(btn_check, btn_del)
-
-            bot.edit_message_text(login_text, chat_id=message.chat.id, message_id=wait_msg.message_id, reply_markup=markup)
-        else:
-            bot.edit_message_text(
-                f"❌ <b>মেইলবক্স পাওয়া যায়নি বা মেয়াদ শেষ হয়ে গেছে!</b>\n\n<i>{res.get('error', 'Mailbox expired or unreachable')}</i>",
-                chat_id=message.chat.id,
-                message_id=wait_msg.message_id
-            )
-
-    # User Support Message Forwarding to Admin
-    elif state == "awaiting_support_text":
-        USER_STATES.pop(user_id, None)
-        user_message_text = message.text
-
-        database.log_activity(user_id, username, first_name, "SUPPORT_MSG", user_message_text[:40])
-
-        all_admins = get_all_admin_ids()
-        admin_alert_text = (
-            f"📩 <b>New Support Message Received!</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>From:</b> {first_name} (@{username if username else 'NoUsername'})\n"
-            f"🆔 <b>User ID:</b> <code>{user_id}</code>\n"
-            f"🕒 <b>Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"📝 <b>Message:</b>\n"
-            f"<i>{user_message_text}</i>"
-        )
-
-        admin_reply_markup = types.InlineKeyboardMarkup()
-        admin_reply_markup.add(types.InlineKeyboardButton("💬 Reply to User", callback_data=f"admreply_{user_id}"))
-
-        for admin_id in all_admins:
-            try:
-                bot.send_message(admin_id, admin_alert_text, reply_markup=admin_reply_markup)
-            except Exception as e:
-                print(f"[Admin Alert Failed] {admin_id}: {e}")
-
-        confirm_text = "✅ আপনার মেসেজটি সফলভাবে এডমিনের কাছে পৌঁছে গেছে!"
-        bot.reply_to(message, confirm_text, reply_markup=get_main_keyboard(user_id))
-
-    # Admin replying to a user's support message
-    elif state and state.startswith("replying_user_"):
-        USER_STATES.pop(user_id, None)
-        target_uid = int(state.split("replying_user_")[1])
-        reply_content = message.text
-
-        user_reply_text = (
-            f"👑 <b>Support Team Response:</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"{reply_content}"
-        )
-        try:
-            bot.send_message(target_uid, user_reply_text)
-            bot.reply_to(message, f"✅ User <code>{target_uid}</code>-কে মেসেজ পাঠানো হয়েছে!", reply_markup=get_main_keyboard(user_id))
-        except Exception as e:
-            bot.reply_to(message, f"❌ মেসেজ পাঠাতে ব্যর্থ হয়েছে: {e}", reply_markup=get_main_keyboard(user_id))
-
-    # Admin: Broadcast
-    elif state == "awaiting_broadcast":
-        USER_STATES.pop(user_id, None)
-        all_users = database.get_all_users()
-        sent = 0
-        failed = 0
-        status_msg = bot.send_message(message.chat.id, f"🚀 ব্রডকাস্ট শুরু হচ্ছে... (মোট: {len(all_users)})")
-
-        for uid in all_users:
-            try:
-                bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
-                sent += 1
-                time.sleep(0.04)
-            except Exception:
-                failed += 1
-
-        bot.edit_message_text(f"✅ <b>Broadcast Completed!</b>\n\n🎯 Sent: {sent}\n❌ Failed/Blocked: {failed}", chat_id=message.chat.id, message_id=status_msg.message_id)
-
-    # Set API Key
-    elif state == "awaiting_api_key":
-        USER_STATES.pop(user_id, None)
-        key = message.text.strip()
-        database.set_setting("vook_api_key", key)
-        bot.reply_to(message, "✅ API Key আপডেট করা হয়েছে!", reply_markup=get_main_keyboard(user_id))
-
-    # Set Support
-    elif state == "awaiting_support":
-        USER_STATES.pop(user_id, None)
-        sup = message.text.strip()
-        database.set_setting("support_link", sup)
-        bot.reply_to(message, f"✅ Support Link আপডেট করা হয়েছে: {sup}", reply_markup=get_main_keyboard(user_id))
-
-    # Ban User
-    elif state == "awaiting_ban_id":
-        USER_STATES.pop(user_id, None)
-        target_str = message.text.strip()
-        if not target_str.isdigit():
-            bot.reply_to(message, "❌ ইনভ্যালিড ইউজার আইডি।")
-            return
-        target_id = int(target_str)
-        currently_banned = database.is_banned(target_id)
-        new_status = 0 if currently_banned else 1
-        database.set_ban_status(target_id, new_status)
-        action_word = "Unbanned ✅" if new_status == 0 else "Banned ⛔"
-        bot.reply_to(message, f"User {target_id} is now {action_word}.", reply_markup=get_main_keyboard(user_id))
-
-# ----------------- Background Inbox Listener -----------------
-
-def background_inbox_poller():
-    """
-    Periodically checks recent active mailboxes in real-time.
-    Uses authentic tokens and session cookies to fetch incoming messages from VookMail.
-    """
-    while True:
-        try:
-            active_mails = database.get_all_active_mails(limit=30)
-            for item in active_mails:
-                user_id = item["user_id"]
-                email = item["email"]
-                token = item.get("token")
-                cookie = item.get("cookie")
-                
-                res = vook_client.get_messages(email, token=token, cookie=cookie)
-                if res.get("success"):
-                    for msg in res.get("messages", []):
-                        msg_id = str(msg.get("id", ""))
-                        if msg_id and not database.is_message_seen(msg_id):
-                            database.mark_message_seen(msg_id, email)
-
-                            sender = msg.get("from", "Unknown")
-                            subject = msg.get("subject", "No Subject")
-                            code = msg.get("verification_code", "") or msg.get("code", "")
-                            link = msg.get("verification_link", "") or msg.get("link", "")
-
-                            notify_text = (
-                                f"📨 <b>New Message Received!</b>\n"
-                                f"━━━━━━━━━━━━━━━━━━\n"
-                                f"📬 <b>To:</b> <code>{email}</code>\n"
-                                f"👤 <b>From:</b> <code>{sender}</code>\n"
-                                f"📝 <b>Subject:</b> <b>{subject}</b>\n"
-                            )
-                            if code:
-                                notify_text += f"\n🔑 <b>Verification Code:</b> <code>{code}</code>\n"
-                            if link:
-                                notify_text += f"\n🔗 <b>Verification Link:</b> <a href=\"{link}\">Click Here</a>\n"
-
-                            markup = build_message_markup(address=email, msg_id=msg_id, code=code, link=link)
-
-                            try:
-                                bot.send_message(user_id, notify_text, reply_markup=markup)
-                            except Exception as e:
-                                print(f"[Notifier] Failed to notify {user_id}: {e}")
-        except Exception as e:
-            print(f"[Poller Exception] {e}")
-
-        time.sleep(8)
-
-# ----------------- Main Entrypoint -----------------
+    logger.info("MailFuetch Bot is starting polling...")
+    app.run_polling()
 
 if __name__ == "__main__":
-    print("=" * 50)
-    print("🤖 VookMail Telegram Bot is Starting...")
-    print(f"👑 Admin IDs: {get_all_admin_ids()}")
-    print(f"💾 Database Engine: {'Supabase PostgreSQL (Cloud 24/7)' if database.USE_POSTGRES else 'Local SQLite (Fallback)'}")
-    print("=" * 50)
-
-    # 1. Start lightweight Render Health Check web server in background daemon
-    web_thread = threading.Thread(target=run_render_web_server, daemon=True)
-    web_thread.start()
-
-    # 2. Check if recovering from a 1-click admin restart
-    restart_chat = database.get_setting("restart_chat_id", "")
-    if restart_chat and restart_chat.isdigit():
-        database.set_setting("restart_chat_id", "")
-        try:
-            bot.send_message(
-                int(restart_chat),
-                "✅ <b>বট সফলভাবে রিস্টার্ট সম্পন্ন হয়েছে এবং সম্পূর্ণ লাইভ ও সক্রিয় আছে!</b>",
-                reply_markup=get_main_keyboard(int(restart_chat))
-            )
-        except Exception as e:
-            print(f"[Restart Notify Error] {e}")
-
-    # 3. Start background inbox listener thread
-    poller_thread = threading.Thread(target=background_inbox_poller, daemon=True)
-    poller_thread.start()
-    print("⚡ Background live inbox notifier started.")
-
-    # 4. Start bot polling
-    print("🚀 Bot is now polling for messages...")
-    bot.infinity_polling(skip_pending=True)
+    main()
