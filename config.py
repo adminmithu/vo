@@ -1,25 +1,25 @@
 import os
+from dotenv import load_dotenv
 
-# Telegram Bot Token (Get it from @BotFather)
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_TELEGRAM_BOT_TOKEN_HERE")
+load_dotenv()
 
-# Admin Telegram IDs (List of integer user IDs)
-ADMIN_IDS = [
-    int(x.strip()) for x in os.getenv("ADMIN_IDS", "0").split(",") if x.strip().isdigit()
-]
+# Telegram Bot Token & Admin Configuration
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8929349073"))
 
-# VookMail API Key (Optional: our PoW engine solves it automatically if empty)
-VOOK_API_KEY = os.getenv("VOOK_API_KEY", "")
+# Domain & Platform Configuration
+DOMAIN = os.getenv("DOMAIN", "muellfach.de")
+MUELLFACH_BASE_URL = os.getenv("MUELLFACH_BASE_URL", f"https://www.{DOMAIN}")
+MUELLFACH_AJAX_URL = f"{MUELLFACH_BASE_URL}/ajax.php"
+MUELLFACH_API_V1_URL = f"{MUELLFACH_BASE_URL}/api/v1"
+MUELLFACH_SYNC_URL = f"{MUELLFACH_AJAX_URL}?action=sync"
+MUELLFACH_API_URL = MUELLFACH_AJAX_URL
 
-# Base URL for VookMail REST API
-VOOK_BASE_URL = "https://www.vookmail.com/api/v1"
+# Database Path (configurable for persistent volume on Render/Railway)
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "mailfuetch.db"))
 
-# Database: Supabase PostgreSQL URL (or empty for local SQLite)
-# Example: postgresql://postgres.xxxx:your_password@aws-0-region.pooler.supabase.com:6543/postgres
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# Polling Interval (in seconds - optimized for ultra-fast OTP forwarding)
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))
 
-# Local SQLite fallback filename
-DB_PATH = os.path.join(os.path.dirname(__file__), "vookmail_bot.db")
-
-# Default Support Link or Username
-DEFAULT_SUPPORT = "@YourSupportUsername"
+# Email Retention Days (10 days as requested)
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "10"))
