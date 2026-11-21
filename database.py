@@ -4,7 +4,8 @@ from datetime import datetime
 import config
 
 # Determine if Supabase PostgreSQL is enabled
-USE_POSTGRES = bool(config.DATABASE_URL and config.DATABASE_URL.startswith("postgres"))
+DATABASE_URL = getattr(config, "DATABASE_URL", os.getenv("DATABASE_URL", ""))
+USE_POSTGRES = bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
 
 if USE_POSTGRES:
     import psycopg2
@@ -12,11 +13,12 @@ if USE_POSTGRES:
 
 def get_connection():
     if USE_POSTGRES:
-        conn = psycopg2.connect(config.DATABASE_URL, cursor_factory=RealDictCursor)
+        conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
         conn.autocommit = True
         return conn
     else:
-        conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
+        db_path = getattr(config, "DB_PATH", os.path.join(os.path.dirname(__file__), "vookmail_bot.db"))
+        conn = sqlite3.connect(db_path, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
 
