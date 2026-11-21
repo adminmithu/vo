@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: vookmail-telegram-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_IDS
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: VOOK_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.9
